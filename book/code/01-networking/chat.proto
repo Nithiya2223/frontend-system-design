@@ -1,0 +1,15 @@
+// chat.proto: the contract for a gRPC service. Field numbers (1, 2, ...) identify fields on the wire.
+syntax = "proto3";
+package chat;
+
+message Message  { string room = 1; string user = 2; string text = 3; int64 sent_at = 4; }
+message Ack      { bool ok = 1; }
+message RoomRequest { string room = 1; }
+message Summary  { int32 count = 1; }
+
+service ChatService {
+  rpc Send(Message) returns (Ack);                       // 1. unary: one request, one response
+  rpc Watch(RoomRequest) returns (stream Message);       // 2. server streaming: one request, many responses
+  rpc Upload(stream Message) returns (Summary);          // 3. client streaming: many requests, one response
+  rpc Talk(stream Message) returns (stream Message);     // 4. bidirectional streaming
+}

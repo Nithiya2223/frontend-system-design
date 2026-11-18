@@ -1,0 +1,23 @@
+# schema.graphql: the contract between client and server.
+type User {
+  id: ID!
+  name: String!
+  posts(first: Int = 3): [Post!]!   # a field can take arguments
+}
+
+type Post {
+  id: ID!
+  title: String!
+}
+
+type Query {
+  user(id: ID!): User               # reads
+}
+
+type Mutation {
+  renameUser(id: ID!, name: String!): User   # writes
+}
+
+type Subscription {
+  postAdded(userId: ID!): Post      # server push, usually over WebSocket
+}

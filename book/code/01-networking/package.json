@@ -1,0 +1,9 @@
+{
+  "name": "networking-examples",
+  "private": true,
+  "description": "Runnable examples for Chapter 1 (Networking)",
+  "dependencies": {
+    "express": "^4.19.0",
+    "ws": "^8.17.0"
+  }
+}

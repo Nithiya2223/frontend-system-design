@@ -1,0 +1,1939 @@
+<h1>Chapter 1: Networking</h1>
+
+<h2 class="part">Chapter at a glance</h2>
+
+<ol>
+  <li>Every frontend feature is a conversation over a network. Its speed is set mostly by <strong>round trips</strong> and <strong>payload size</strong>, not by raw bandwidth.</li>
+  <li>Networks are built in <strong>layers</strong>. You work at the application layer (HTTP, WebSocket), but TCP, TLS, IP and DNS decide how fast it feels.</li>
+  <li>A page load is a chain: DNS, then TCP, then TLS, then HTTP. Caches and CDNs exist to skip links in that chain.</li>
+  <li>To fetch data you choose between <strong>REST, GraphQL and gRPC</strong>. To get live updates you choose between <strong>polling, SSE and WebSocket</strong>. Each choice is a trade-off, not a ranking.</li>
+  <li>A production client assumes the network fails: timeouts, cancellation, retries with backoff and jitter, and graceful degradation.</li>
+</ol>
+
+<table>
+  <caption>Key terms</caption>
+  <thead><tr><th>Term</th><th>Meaning in one line</th></tr></thead>
+  <tbody>
+    <tr><td>Latency, RTT</td><td>Time for a message to travel one way. RTT (round-trip time) is there and back.</td></tr>
+    <tr><td>Bandwidth, throughput</td><td>Capacity of the link, and the data rate you actually get.</td></tr>
+    <tr><td>Encapsulation</td><td>Each layer wraps the data from the layer above in its own header.</td></tr>
+    <tr><td>Handshake</td><td>The setup messages that must complete before real data flows (TCP, TLS).</td></tr>
+    <tr><td>Idempotent</td><td>Repeating the request leaves the server in the same state as sending it once.</td></tr>
+    <tr><td>Preflight</td><td>An <code>OPTIONS</code> request the browser sends first to ask a server whether a cross-origin request is allowed.</td></tr>
+    <tr><td>Multiplexing</td><td>Many requests sharing one connection at the same time.</td></tr>
+    <tr><td>Backoff and jitter</td><td>Waiting longer after each failure, with a random element so clients do not retry in lockstep.</td></tr>
+  </tbody>
+</table>
+
+<h2 class="part newpage">Core concepts</h2>
+
+<!-- ======================================================================= 1.1 -->
+<h2>Why networking matters in frontend system design</h2>
+<p class="overview">This topic explains how networking shows up in interviews and defines the words you will use in every later answer. Without exact vocabulary, trade-off arguments stay vague.</p>
+
+<h3>How networking questions appear in interviews</h3>
+<p>
+  Interviewers rarely ask you to recite what TCP stands for. They ask a design question, such as "how does the feed update live?", and listen for the networking decisions inside your answer. They look for four things: you name the data flow, you choose a protocol and say why, you estimate cost in round trips and bytes, and you say what happens when the network fails. <a class="figref" href="#fig-interview-flow"></a> shows that sequence as a checklist you can run on any question.
+</p>
+<figure class="diagram" id="fig-interview-flow">
+  <pre class="mermaid">
+flowchart LR
+  Q["Design question"] -->|"sketch who talks to whom"| F["Name the data flow"]
+  F -->|"compare options"| P["Pick a protocol"]
+  P -->|"quantify"| C["Estimate round trips and payload"]
+  C -->|"stress it"| E["Handle failure and scale"]
+  </pre>
+  <figcaption>The four-step networking answer</figcaption>
+</figure>
+<p>
+  Read the figure left to right. Each box is something to say out loud; skipping "Estimate" or "Handle failure" is the most common reason an answer sounds shallow.
+</p>
+
+<h3>The vocabulary: latency, bandwidth, throughput, round trips, payload size</h3>
+<p>
+  <strong>Latency</strong> is how long one message takes to arrive. <strong>Bandwidth</strong> is how much the link could carry per second. <strong>Throughput</strong> is what you really get, which is lower because of loss, congestion and protocol overhead. A <strong>round trip</strong> is a request plus its response, so one round trip costs one RTT. <strong>Payload size</strong> is the number of bytes you send.
+  Why it matters: loading a small file is limited by RTT, while loading a large file is limited by throughput. Most API calls are small, so they are RTT-bound. In <a class="figref" href="#fig-rtt"></a>, the browser is idle for a whole RTT after each request.
+</p>
+<figure class="diagram" id="fig-rtt">
+  <pre class="mermaid">
+sequenceDiagram
+  participant B as Browser
+  participant S as Server
+  B->>S: Request (travels half an RTT)
+  Note over B,S: Server works (processing time)
+  S-->>B: First byte of response (the other half)
+  S-->>B: Rest of the payload (limited by throughput)
+  </pre>
+  <figcaption>One round trip: where latency and throughput each apply</figcaption>
+</figure>
+<p>
+  Two requests in sequence cost two RTTs plus two processing times, even on a fast link. That is why batching, caching and keeping connections open often help more than a faster connection. The script below turns this into numbers.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/latency-math.js"></code></pre>
+
+<aside class="callout key-idea">
+  <p>For small requests, cut round trips. For large responses, cut bytes. Buying more bandwidth helps only the second case.</p>
+</aside>
+
+<!-- ======================================================================= 1.2 -->
+<h2>Network layers</h2>
+<p class="overview">Layering is how the network is organised so that each part can change without breaking the others. Knowing which protocol lives on which layer lets you place any problem, from a DNS failure to a slow handshake, on the right layer.</p>
+
+<h3>Why layering exists</h3>
+<p>
+  A network has too many jobs for one component: moving bits, finding routes, retransmitting lost data, encrypting, and formatting messages. Layering splits these jobs. Each layer does one thing and serves only the layer above it, hiding how it works. This is separation of concerns, and the design pattern is <strong>Layered architecture</strong>.
+  The payoff: HTTP does not care whether the bits travel over Wi-Fi or Ethernet, so a phone can switch networks without any change in your <code>fetch</code> code. <a class="figref" href="#fig-why-layers"></a> shows the dependency direction.
+</p>
+<figure class="diagram" id="fig-why-layers">
+  <pre class="mermaid">
+flowchart TB
+  A["Your fetch call (HTTP)"] -->|"asks for reliable delivery"| B["TCP"]
+  B -->|"asks for routing"| C["IP"]
+  C -->|"asks for transmission on this link"| D["Wi-Fi or Ethernet"]
+  </pre>
+  <figcaption>Each layer relies only on the layer directly below</figcaption>
+</figure>
+<p>
+  Replace the bottom box and nothing above it changes. That is the whole argument for layers.
+</p>
+
+<h3>The OSI model and the TCP/IP model, side by side</h3>
+<p>
+  Two models describe the layers. <strong>OSI</strong> has seven layers and is the teaching vocabulary: engineers say "layer 7" and "layer 4". <strong>TCP/IP</strong> has four layers and describes what the internet actually runs. They describe the same stack with different groupings, as <a class="figref" href="#fig-osi-tcpip"></a> shows.
+</p>
+<figure class="diagram" id="fig-osi-tcpip">
+  <table class="stack">
+    <thead><tr><th colspan="2">OSI model (7 layers)</th><th>TCP/IP model (4 layers)</th></tr></thead>
+    <tbody>
+      <tr><td class="n">7</td><td>Application</td><td rowspan="3">Application</td></tr>
+      <tr><td class="n">6</td><td>Presentation</td></tr>
+      <tr><td class="n">5</td><td>Session</td></tr>
+      <tr><td class="n">4</td><td>Transport</td><td>Transport</td></tr>
+      <tr><td class="n">3</td><td>Network</td><td>Internet</td></tr>
+      <tr><td class="n">2</td><td>Data link</td><td rowspan="2">Link (network access)</td></tr>
+      <tr><td class="n">1</td><td>Physical</td></tr>
+    </tbody>
+  </table>
+  <figcaption>OSI layers mapped onto TCP/IP layers</figcaption>
+</figure>
+<p>
+  TCP/IP merges OSI layers 5 to 7 into one Application layer, and layers 1 and 2 into one Link layer. Transport and Network (called Internet in TCP/IP) line up one to one.
+</p>
+
+<h3>Each layer explained simply</h3>
+<p>
+  <a class="figref" href="#fig-layer-stack"></a> lists what each OSI layer does, the unit of data it handles, how it addresses things, and example protocols. Read it top to bottom as the path an outgoing request takes.
+</p>
+<figure class="diagram" id="fig-layer-stack">
+  <table class="stack">
+    <thead><tr><th>#</th><th>Layer</th><th>Job</th><th>Data unit</th><th>Address</th><th>Examples</th></tr></thead>
+    <tbody>
+      <tr class="mark"><td class="n">7</td><td>Application</td><td>Message format and meaning for apps</td><td>Data</td><td>Hostname, URL</td><td>HTTP, HTTPS, DNS, WebSocket, SMTP, FTP, SSH</td></tr>
+      <tr><td class="n">6</td><td>Presentation</td><td>Encoding, compression, encryption</td><td>Data</td><td>none</td><td>TLS (placed here in OSI), UTF-8, gzip</td></tr>
+      <tr><td class="n">5</td><td>Session</td><td>Start, keep and end a conversation</td><td>Data</td><td>none</td><td>TLS sessions, RPC sessions</td></tr>
+      <tr class="mark"><td class="n">4</td><td>Transport</td><td>Process-to-process delivery, reliability</td><td>Segment (TCP), datagram (UDP)</td><td>Port</td><td>TCP, UDP, QUIC (over UDP)</td></tr>
+      <tr class="mark"><td class="n">3</td><td>Network</td><td>Routing across networks</td><td>Packet</td><td>IP address</td><td>IP, ICMP, routing protocols</td></tr>
+      <tr><td class="n">2</td><td>Data link</td><td>Delivery to the next device on one link</td><td>Frame</td><td>MAC address</td><td>Ethernet, Wi-Fi, ARP</td></tr>
+      <tr><td class="n">1</td><td>Physical</td><td>Signals on the medium</td><td>Bits</td><td>none</td><td>Cables, fibre, radio</td></tr>
+    </tbody>
+  </table>
+  <figcaption>The layer stack with data units, addresses and protocols</figcaption>
+</figure>
+<p>
+  In plain words:
+</p>
+<ul>
+  <li><strong>Application:</strong> what the two programs say to each other, such as an HTTP request.</li>
+  <li><strong>Presentation:</strong> how that message is encoded and protected, such as UTF-8 text or TLS encryption.</li>
+  <li><strong>Session:</strong> keeping a conversation open and recoverable. In practice, few stacks have a separate session layer.</li>
+  <li><strong>Transport:</strong> getting data to the right program on the other machine, using a port number.</li>
+  <li><strong>Network:</strong> finding a path across many networks, using an IP address.</li>
+  <li><strong>Data link:</strong> moving a frame to the next device on the same link, using a MAC address.</li>
+  <li><strong>Physical:</strong> turning bits into electrical, optical or radio signals.</li>
+</ul>
+<aside class="callout key-idea">
+  <p>TLS is placed differently in the two models. OSI puts encryption at the presentation layer. TCP/IP has no such layer, so TLS is treated as part of the application layer, running on top of TCP. HTTP/3 goes further: QUIC builds TLS 1.3 into the transport itself.</p>
+</aside>
+
+<h3>Encapsulation and decapsulation</h3>
+<p>
+  To send an HTTP request, each layer wraps what it receives from above inside its own header. This is <strong>encapsulation</strong>. The receiver does the reverse, unwrapping one header per layer: <strong>decapsulation</strong>. Each header holds only what that layer needs: ports for the transport layer, IP addresses for the network layer, MAC addresses for the link layer. <a class="figref" href="#fig-encapsulation"></a> shows the sending side.
+</p>
+<figure class="diagram" id="fig-encapsulation">
+  <pre class="mermaid">
+flowchart TD
+  A["HTTP request (data)"] -->|"add TCP header with ports"| B["TCP segment"]
+  B -->|"add IP header with addresses"| C["IP packet"]
+  C -->|"add Ethernet header and trailer with MACs"| D["Ethernet frame"]
+  D -->|"encode as signals"| E["Bits on the wire"]
+  </pre>
+  <figcaption>Encapsulation of one HTTP request on the sending side</figcaption>
+</figure>
+<p>
+  The server reads the diagram bottom to top. The link layer checks the MAC address, the network layer checks the IP address, the transport layer uses the port to pick the right process, and the application finally sees the original HTTP text. With HTTPS, TLS encrypts the HTTP message before it becomes the TCP payload. The script below builds and unwraps these layers.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/encapsulation.js"></code></pre>
+
+<h3>TCP vs UDP in detail, and where QUIC fits</h3>
+<p>
+  <strong>TCP</strong> first sets up a connection with a handshake, then delivers a reliable, ordered stream of bytes. It numbers bytes, acknowledges them and retransmits losses. <strong>Flow control</strong> stops a fast sender from overwhelming a slow receiver. <strong>Congestion control</strong> slows the sender when the network is overloaded. The price is extra round trips at the start, and <em>head-of-line blocking</em>: one lost segment delays everything behind it.
+  <strong>UDP</strong> sends independent datagrams with no connection, no ordering and no retransmission. It is fast and simple, and the application decides what to do about loss. <a class="figref" href="#fig-tcp-udp"></a> contrasts the two.
+</p>
+<figure class="diagram" id="fig-tcp-udp">
+  <pre class="mermaid">
+flowchart LR
+  subgraph TCPSIDE["TCP"]
+    T1["Handshake: SYN, SYN-ACK, ACK"] -->|"then"| T2["Ordered, acknowledged bytes"]
+    T2 -->|"loss detected"| T3["Retransmit and slow down"]
+  end
+  subgraph UDPSIDE["UDP"]
+    U1["Datagram"] -->|"sent once"| U2["May arrive late, twice or never"]
+  end
+  </pre>
+  <figcaption>TCP versus UDP behaviour</figcaption>
+</figure>
+<p>
+  TCP spends effort to hide the network's flaws; UDP exposes them. <strong>QUIC</strong> is a newer transport built on top of UDP. It adds reliability, ordering per stream, congestion control and TLS 1.3, and it removes TCP's cross-stream head-of-line blocking. HTTP/3 runs on QUIC. Use <a class="figref" href="#fig-transport-choice"></a> to choose.
+</p>
+<figure class="diagram" id="fig-transport-choice">
+  <pre class="mermaid">
+flowchart TD
+  Q{"Must every byte arrive, in order?"} -->|"yes"| TCPN["TCP: HTTP/1.1, HTTP/2, WebSocket, SSH"]
+  Q -->|"no"| L{"Is low delay worth losing some data?"}
+  L -->|"yes"| UDPN["UDP: live video, games, DNS queries"]
+  L -->|"no, but want fewer round trips"| QN["QUIC over UDP: HTTP/3"]
+  </pre>
+  <figcaption>Which transport for which use case</figcaption>
+</figure>
+<p>
+  Start at the top question. Most web traffic ends at TCP or QUIC; UDP is chosen when a late packet is worse than a missing one. Run the script below to see both transports exchange the same message.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/tcp-udp.js"></code></pre>
+
+<h3>Which device works at which layer</h3>
+<p>
+  A device is defined by the deepest header it reads. A <strong>switch</strong> reads MAC addresses (layer 2). A <strong>router</strong> reads IP addresses (layer 3). A <strong>layer 4 load balancer</strong> routes by IP and port without reading HTTP. A <strong>layer 7 load balancer</strong> reads URLs, headers and cookies, so it can route <code>/api</code> and <code>/images</code> to different servers. Proxies, API gateways and CDN edges work at layer 7. Firewalls range from layer 3 and 4 packet filters to layer 7 web application firewalls. <a class="figref" href="#fig-journey"></a> follows one request across them.
+</p>
+<figure class="diagram" id="fig-journey">
+  <pre class="mermaid">
+flowchart LR
+  C["Client"] -->|"Wi-Fi frame to the router"| R["Home router (L3)"]
+  R -->|"IP packets"| I["ISP and internet routers (L3)"]
+  I -->|"IP packets"| LB["Load balancer (L4 or L7)"]
+  LB -->|"HTTP request"| S["Web server"]
+  </pre>
+  <figcaption>A request's journey from client to server</figcaption>
+</figure>
+<p>
+  The frame is rebuilt at every hop (new MAC addresses), while the IP packet inside keeps its source and destination addresses end to end.
+</p>
+<table>
+  <caption>Devices and the layer they work at</caption>
+  <thead><tr><th>Device</th><th>Layer</th><th>What it reads or decides</th></tr></thead>
+  <tbody>
+    <tr><td>Switch</td><td>2 (data link)</td><td>MAC address, forwards within one network</td></tr>
+    <tr><td>Router</td><td>3 (network)</td><td>IP address, chooses the next hop between networks</td></tr>
+    <tr><td>Firewall</td><td>3 to 4, or 7 for a WAF</td><td>IPs and ports, or HTTP content for a web application firewall</td></tr>
+    <tr><td>L4 load balancer</td><td>4 (transport)</td><td>IP and port. Fast, blind to HTTP.</td></tr>
+    <tr><td>L7 load balancer, reverse proxy, API gateway</td><td>7 (application)</td><td>URL, headers, cookies. Can route, cache, terminate TLS.</td></tr>
+    <tr><td>CDN edge server</td><td>7 (application)</td><td>Caches HTTP responses near the user</td></tr>
+  </tbody>
+</table>
+
+<h3>Ports and sockets</h3>
+<p>
+  An IP address finds a machine; a <strong>port</strong> (0 to 65535) finds a program on it. A <strong>socket</strong> is one end of a conversation, and a connection is identified by four values: source IP, source port, destination IP and destination port. The server keeps listening on one well-known port, while each client connection uses a different temporary source port. That is how one server on port 443 serves thousands of clients, and how two browser tabs to the same site stay separate (<a class="figref" href="#fig-sockets"></a>).
+</p>
+<figure class="diagram" id="fig-sockets">
+  <pre class="mermaid">
+flowchart LR
+  T1["Tab 1: 192.168.1.20 port 51724"] -->|"connects to"| S["Server 203.0.113.10 port 443"]
+  T2["Tab 2: 192.168.1.20 port 51725"] -->|"connects to"| S
+  </pre>
+  <figcaption>Two sockets to the same server port, told apart by the client port</figcaption>
+</figure>
+<p>
+  Run <code>tcp-udp.js</code> from the previous section again: it prints the client's temporary port next to the server's port.
+</p>
+<table>
+  <caption>Common port numbers</caption>
+  <thead><tr><th>Port</th><th>Protocol</th><th>Port</th><th>Protocol</th></tr></thead>
+  <tbody>
+    <tr><td>80</td><td>HTTP</td><td>22</td><td>SSH</td></tr>
+    <tr><td>443</td><td>HTTPS (and HTTP/3 over UDP)</td><td>25</td><td>SMTP</td></tr>
+    <tr><td>53</td><td>DNS</td><td>21</td><td>FTP</td></tr>
+  </tbody>
+</table>
+
+<h3>Where a frontend developer's work sits</h3>
+<p>
+  Your code lives mostly at the application layer: URLs, methods, headers, JSON, WebSocket messages. But the lower layers set the cost of every request. A slow DNS lookup, a TCP or TLS handshake on a far-away server, or a large payload all show up as a slow screen. The skill is to look at the timing breakdown and decide which layer to fix (<a class="figref" href="#fig-which-layer"></a>).
+</p>
+<figure class="diagram" id="fig-which-layer">
+  <pre class="mermaid">
+flowchart TD
+  A["A request feels slow"] -->|"open DevTools, Network, Timing"| B{"Where is the time?"}
+  B -->|"DNS, connecting or TLS"| C["Connection setup: CDN, keep-alive, HTTP/3, fewer origins"]
+  B -->|"Waiting for server"| D["Backend or cache"]
+  B -->|"Content download"| E["Payload: compress, paginate, cache"]
+  </pre>
+  <figcaption>Finding the layer behind a slow request</figcaption>
+</figure>
+<p>
+  Paste the snippet below into the browser console on any page to get the same breakdown for the page load.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/perf-timing.js"></code></pre>
+
+<h3>A mnemonic for the OSI layers</h3>
+<p>
+  To remember the order from the bottom, use <em>"Please Do Not Throw Sausage Pizza Away"</em>: Physical, Data link, Network, Transport, Session, Presentation, Application. Going the other way, from layer 7 down, <em>"All People Seem To Need Data Processing"</em> works. <a class="figref" href="#fig-mnemonic"></a> pairs each layer with its mnemonic word.
+</p>
+<figure class="diagram" id="fig-mnemonic">
+  <pre class="mermaid">
+flowchart TB
+  L7["7 Application: Away"] -->|"hands data down"| L6["6 Presentation: Pizza"]
+  L6 -->|"hands data down"| L5["5 Session: Sausage"]
+  L5 -->|"hands data down"| L4["4 Transport: Throw"]
+  L4 -->|"hands data down"| L3["3 Network: Not"]
+  L3 -->|"hands data down"| L2["2 Data link: Do"]
+  L2 -->|"hands data down"| L1["1 Physical: Please"]
+  </pre>
+  <figcaption>The seven OSI layers with the "Please Do Not Throw Sausage Pizza Away" mnemonic</figcaption>
+</figure>
+<p>
+  The arrows show the direction of an outgoing request. An incoming response travels back up the same stack.
+</p>
+
+<!-- ======================================================================= 1.3 -->
+<h2>How the web works</h2>
+<p class="overview">This topic follows one page load from a typed URL to the first byte of the response: name lookup, connection, encryption, request. Each step has a cost in round trips, and each step has a trick to skip it.</p>
+
+<h3>The client-server model and the anatomy of a URL</h3>
+<p>
+  The web uses the <strong>client-server</strong> pattern: a client (your browser) starts a request and a server answers it. The server never contacts the client first. A URL tells the client everything it needs to start: which protocol to speak, which machine to find, which program on that machine, and which resource to ask for. <a class="figref" href="#fig-url"></a> breaks one URL into its parts.
+</p>
+<figure class="diagram" id="fig-url">
+  <pre class="mermaid">
+flowchart LR
+  U["https://shop.example.com/items/42?color=red"] -->|"before the colon"| S["scheme: https"]
+  U -->|"after the scheme"| H["host: shop.example.com"]
+  U -->|"implied by the scheme"| P["port: 443"]
+  U -->|"starts with a slash"| PA["path: /items/42"]
+  U -->|"after the question mark"| Q["query: color=red"]
+  U -->|"after the hash mark"| F["fragment: never sent to the server"]
+  </pre>
+  <figcaption>The parts of a URL</figcaption>
+</figure>
+<p>
+  The scheme chooses the protocol and the default port. The host is resolved with DNS. The path and query go into the HTTP request line. The fragment stays in the browser, which uses it to scroll or to route inside a single-page app.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/url-parse.js"></code></pre>
+
+<h3>DNS resolution</h3>
+<p>
+  Computers route by IP address, but people use names. <strong>DNS</strong> is the distributed lookup service that turns <code>shop.example.com</code> into an address. A <strong>recursive resolver</strong> (run by your ISP or a public service) does the work for you: it asks a root server, then the top-level-domain (TLD) server for <code>com</code>, then the <strong>authoritative</strong> server that owns <code>example.com</code>. Answers carry a <strong>TTL</strong> (time to live) that says how long they may be cached. <a class="figref" href="#fig-dns"></a> shows an uncached lookup.
+</p>
+<figure class="diagram" id="fig-dns">
+  <pre class="mermaid">
+sequenceDiagram
+  participant B as Browser and OS
+  participant R as Recursive resolver
+  participant Root as Root server
+  participant T as TLD server for com
+  participant A as Authoritative server
+  B->>B: Check browser and OS caches
+  B->>R: Where is shop.example.com?
+  R->>Root: Where is shop.example.com?
+  Root-->>R: Ask the com TLD servers
+  R->>T: Where is shop.example.com?
+  T-->>R: Ask the example.com nameserver
+  R->>A: Where is shop.example.com?
+  A-->>R: Address 203.0.113.10 with a TTL
+  R-->>B: 203.0.113.10 (cached until the TTL ends)
+  </pre>
+  <figcaption>DNS resolution with a cold cache</figcaption>
+</figure>
+<p>
+  Most lookups never reach the root: the browser cache, the operating system cache, the home router and the resolver each remember recent answers until the TTL expires. A cold lookup costs several round trips; a cached one costs none. DNS usually runs over UDP on port 53. The script below asks the operating system's resolver for an address.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/dns-lookup.js"></code></pre>
+
+<h3>The TCP three-way handshake</h3>
+<p>
+  Before sending data, TCP makes both sides agree on starting sequence numbers. The client sends <code>SYN</code>, the server replies <code>SYN-ACK</code>, and the client confirms with <code>ACK</code>. The client may send data right after its <code>ACK</code>, so the handshake costs one round trip before the first byte of the request (<a class="figref" href="#fig-tcp-handshake"></a>).
+</p>
+<figure class="diagram" id="fig-tcp-handshake">
+  <pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: SYN (let us connect, my sequence starts at x)
+  S-->>C: SYN-ACK (agreed, mine starts at y)
+  C->>S: ACK (connection open)
+  C->>S: First data, for example the HTTP request
+  </pre>
+  <figcaption>TCP three-way handshake</figcaption>
+</figure>
+<p>
+  This is why <strong>keep-alive</strong> (reusing one connection for many requests) matters: it pays the handshake once. The script below measures a handshake against a local server; point it at a remote host to see a real round trip.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/tcp-connect-time.js"></code></pre>
+
+<h3>The TLS handshake and HTTPS</h3>
+<p>
+  <strong>HTTPS</strong> is HTTP carried inside <strong>TLS</strong>. TLS gives three guarantees: privacy (encryption), integrity (tampering is detected) and authentication (the server proves its identity with a certificate signed by a trusted authority). In TLS 1.3 the handshake takes one round trip after TCP; TLS 1.2 needed two. <a class="figref" href="#fig-tls"></a> shows the TLS 1.3 exchange.
+</p>
+<figure class="diagram" id="fig-tls">
+  <pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: ClientHello (versions, ciphers, key share, server name)
+  S-->>C: ServerHello, certificate, proof of key ownership, Finished
+  Note over C,S: Client checks the certificate chain, hostname and expiry
+  C->>S: Finished, then the encrypted HTTP request
+  S-->>C: Encrypted HTTP response
+  </pre>
+  <figcaption>TLS 1.3 handshake</figcaption>
+</figure>
+<p>
+  After the client checks the certificate, both sides share keys and everything that follows is encrypted. A returning client can resume a session and, with <strong>0-RTT</strong>, send data in the first flight, though 0-RTT data can be replayed by an attacker, so servers should only accept safe requests that way. The <code>perf-timing.js</code> snippet from section 1.2.8 shows the TLS time of a real page load.
+</p>
+
+<h3>What happens when you type a URL and press Enter</h3>
+<p>
+  This is the most common networking interview question. The network part is a chain of steps, and each step belongs to a layer from section 1.2. <a class="figref" href="#fig-url-lifecycle"></a> shows the chain with the cache shortcuts that skip steps. What the browser does with the response (parsing, layout, paint) is covered in the rendering chapter.
+</p>
+<figure class="diagram" id="fig-url-lifecycle">
+  <pre class="mermaid">
+flowchart TD
+  A["1 Parse the URL (L7)"] -->|"check HTTP cache"| B{"Fresh copy?"}
+  B -->|"yes"| Z["Use the cached response"]
+  B -->|"no"| C["2 DNS lookup (L7 over UDP)"]
+  C -->|"IP address"| D["3 TCP handshake (L4)"]
+  D -->|"connection open"| E["4 TLS handshake (L5 to L6)"]
+  E -->|"encrypted channel"| F["5 Send the HTTP request (L7)"]
+  F -->|"IP packets routed hop by hop (L3, L2)"| G["6 CDN edge or load balancer"]
+  G -->|"forward to origin if needed"| H["7 Server builds the response"]
+  H -->|"HTTP response"| I["8 Browser receives bytes, then renders"]
+  </pre>
+  <figcaption>From typed URL to response, with the layer of each step</figcaption>
+</figure>
+<p>
+  Follow the arrows from the top. A fresh cache entry ends the journey at step 1. Otherwise the browser resolves the name, opens TCP, then TLS, then sends the request, and any of these steps may be shortened by a cached DNS answer, a reused connection or a CDN hit.
+</p>
+
+<h3>CDNs and edge caching</h3>
+<p>
+  A <strong>CDN</strong> (content delivery network) is a set of servers spread around the world. Users connect to the nearest <strong>edge</strong> server, which answers from its cache if it can and fetches from the <strong>origin</strong> only on a miss. This cuts round-trip time (the server is close), cuts load on the origin, and absorbs traffic spikes. The origin controls what may be cached through <code>Cache-Control</code> headers (<a class="figref" href="#fig-cdn"></a>).
+</p>
+<figure class="diagram" id="fig-cdn">
+  <pre class="mermaid">
+flowchart TD
+  U["User request"] -->|"routed to the nearest edge"| E{"In edge cache and fresh?"}
+  E -->|"hit"| H["Edge answers immediately"]
+  E -->|"miss"| O["Edge asks the origin"]
+  O -->|"response with Cache-Control"| S["Edge stores it, then answers"]
+  </pre>
+  <figcaption>CDN cache hit and miss</figcaption>
+</figure>
+<p>
+  The first user in a region pays for the miss; everyone after gets the hit. Static, fingerprinted files cache best. The snippet below reads response headers that CDNs commonly add (header names differ per provider, VERIFY for yours).
+</p>
+<pre><code class="language-javascript">// Run in the browser console on a site that uses a CDN.
+const res = await fetch('/logo.png');
+console.log({
+  age: res.headers.get('age'),                   // seconds the object has been in a shared cache
+  cacheControl: res.headers.get('cache-control'), // the origin's caching rules
+  cdnStatus: res.headers.get('x-cache') ?? res.headers.get('cf-cache-status'), // HIT or MISS (provider specific)
+});</code></pre>
+
+<aside class="callout interview-tip">
+  <p>When asked "what happens when you type a URL", answer in layers and name the cache shortcut at each step. It shows you know the cost of each step, not just the order.</p>
+</aside>
+
+<!-- ======================================================================= 1.4 -->
+<h2>HTTP in depth</h2>
+<p class="overview">HTTP is the language your frontend speaks every day. This topic covers its message format, its caching rules, its security-related headers and how its versions differ.</p>
+
+<h3>Request and response anatomy</h3>
+<p>
+  An HTTP message is plain text: a <strong>start line</strong>, <strong>headers</strong>, a blank line and an optional <strong>body</strong>. A request starts with a method and a path; a response starts with a status code. HTTP is <strong>stateless</strong>: each request carries everything the server needs, which is why cookies and tokens exist. <a class="figref" href="#fig-http-anatomy"></a> shows one exchange.
+</p>
+<figure class="diagram" id="fig-http-anatomy">
+  <pre class="mermaid">
+sequenceDiagram
+  participant B as Browser
+  participant S as Server
+  B->>S: GET /users/42 HTTP/1.1 with headers Host and Accept, no body
+  S-->>B: HTTP/1.1 200 OK with headers Content-Type and Cache-Control, then a JSON body
+  </pre>
+  <figcaption>One HTTP request and response</figcaption>
+</figure>
+<p>
+  The request line has three parts (method, path, version). The response line has the version, the status code and a reason phrase. The script below sends a raw request over a TCP socket and prints the raw reply.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/raw-http.js"></code></pre>
+
+<h3>Methods: safe and idempotent</h3>
+<p>
+  A method says what you want to do. A <strong>safe</strong> method does not change server state (<code>GET</code>, <code>HEAD</code>, <code>OPTIONS</code>). An <strong>idempotent</strong> method has the same effect whether you send it once or ten times (<code>GET</code>, <code>PUT</code>, <code>DELETE</code>). <code>POST</code> is neither, and <code>PATCH</code> is not guaranteed to be idempotent. Idempotency decides whether a failed request can be retried automatically, as <a class="figref" href="#fig-methods"></a> shows.
+</p>
+<figure class="diagram" id="fig-methods">
+  <pre class="mermaid">
+flowchart TD
+  M{"Does it change server state?"} -->|"no"| SAFE["Safe: GET, HEAD, OPTIONS. Cacheable and retry-friendly"]
+  M -->|"yes"| I{"Same result if repeated?"}
+  I -->|"yes"| IDEM["Idempotent: PUT, DELETE. Safe to retry"]
+  I -->|"no"| NON["Not idempotent: POST, PATCH. Retry only with an idempotency key"]
+  </pre>
+  <figcaption>Classifying an HTTP method</figcaption>
+</figure>
+<p>
+  Safe methods are also idempotent, but not the other way round: <code>DELETE</code> changes state, yet deleting twice leaves the same end state.
+</p>
+
+<h3>Status code families</h3>
+<p>
+  The first digit of the status code tells you what happened. <a class="figref" href="#fig-status"></a> maps the five families, and the table lists the codes you will meet most.
+</p>
+<figure class="diagram" id="fig-status">
+  <pre class="mermaid">
+flowchart LR
+  R["Response arrives"] -->|"1xx"| I1["Informational: keep waiting"]
+  R -->|"2xx"| I2["Success: the request worked"]
+  R -->|"3xx"| I3["Redirect: look elsewhere or use your cache"]
+  R -->|"4xx"| I4["Client error: fix the request"]
+  R -->|"5xx"| I5["Server error: may retry"]
+  </pre>
+  <figcaption>The five status code families</figcaption>
+</figure>
+<table>
+  <caption>Status codes worth knowing</caption>
+  <thead><tr><th>Code</th><th>Meaning</th><th>Frontend reaction</th></tr></thead>
+  <tbody>
+    <tr><td>200, 201, 204</td><td>OK, Created, No Content</td><td>Use the data; 204 has no body, so do not call <code>res.json()</code></td></tr>
+    <tr><td>301, 302, 304</td><td>Moved permanently, Found (temporary), Not Modified</td><td>Browser follows or reuses its cache</td></tr>
+    <tr><td>400, 422</td><td>Bad request, Unprocessable content</td><td>Show validation errors, do not retry</td></tr>
+    <tr><td>401, 403</td><td>Not authenticated, Not allowed</td><td>401: sign in or refresh the token. 403: show "no access".</td></tr>
+    <tr><td>404, 409</td><td>Not found, Conflict</td><td>Show not-found; on 409 reload and let the user resolve</td></tr>
+    <tr><td>429</td><td>Too many requests</td><td>Wait for <code>Retry-After</code>, then retry</td></tr>
+    <tr><td>500, 502, 503, 504</td><td>Server error, Bad gateway, Unavailable, Gateway timeout</td><td>Retry idempotent requests with backoff</td></tr>
+  </tbody>
+</table>
+<p>
+  A classic trap: <code>fetch</code> only rejects on network failure, not on 4xx or 5xx. Check <code>res.ok</code> yourself.
+</p>
+<pre><code class="language-javascript">async function getJson(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`); // fetch resolves even for 404 and 500
+  return res.status === 204 ? null : res.json();      // 204 has no body to parse
+}</code></pre>
+
+<h3>Important headers</h3>
+<p>
+  Headers carry metadata so the body can stay simple. Request headers describe the client and what it wants; response headers describe the body and how to handle it. <a class="figref" href="#fig-headers"></a> groups the ones you need most.
+</p>
+<figure class="diagram" id="fig-headers">
+  <pre class="mermaid">
+flowchart LR
+  B["Browser"] -->|"Host, Accept, Accept-Encoding, Authorization, Cookie, Origin, If-None-Match"| S["Server"]
+  S -->|"Content-Type, Content-Encoding, Cache-Control, ETag, Set-Cookie, Location, Access-Control-*"| B
+  </pre>
+  <figcaption>Headers most used in each direction</figcaption>
+</figure>
+<p>
+  The top arrow is what the client says; the bottom arrow is what the server answers. <code>Content-Type</code> tells the browser how to read the body, <code>Location</code> drives redirects, and <code>Access-Control-*</code> headers drive CORS.
+</p>
+
+<h3>Content negotiation and compression</h3>
+<p>
+  With <strong>content negotiation</strong> the client lists what it can handle and the server picks one: <code>Accept</code> for format, <code>Accept-Language</code> for language, <code>Accept-Encoding</code> for compression. The server states its choice in <code>Content-Type</code>, <code>Content-Language</code> and <code>Content-Encoding</code>, and adds <code>Vary</code> so caches store one copy per variation (<a class="figref" href="#fig-negotiation"></a>). Compression trades a little CPU for far fewer bytes on text.
+</p>
+<figure class="diagram" id="fig-negotiation">
+  <pre class="mermaid">
+sequenceDiagram
+  participant B as Browser
+  participant S as Server
+  B->>S: Accept-Encoding br, gzip and Accept-Language en
+  S-->>B: Content-Encoding br, Content-Language en, Vary Accept-Encoding
+  </pre>
+  <figcaption>Content negotiation for compression and language</figcaption>
+</figure>
+<p>
+  The browser decompresses transparently, so your code never sees the encoding. Brotli (<code>br</code>) usually compresses text better than gzip. Already-compressed files such as JPEG and WOFF2 should not be compressed again.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/compression-demo.js"></code></pre>
+
+<h3>HTTP caching</h3>
+<p>
+  The fastest request is the one never sent. The <code>Cache-Control</code> header tells browsers and shared caches whether to store a response and for how long. When a stored copy is <strong>stale</strong>, the browser can <strong>revalidate</strong> it with a conditional request (<code>If-None-Match</code> with the <code>ETag</code>, or <code>If-Modified-Since</code> with <code>Last-Modified</code>), and the server answers <code>304 Not Modified</code> with no body if nothing changed. <a class="figref" href="#fig-cache-decision"></a> shows the decision a browser makes.
+</p>
+<figure class="diagram" id="fig-cache-decision">
+  <pre class="mermaid">
+flowchart TD
+  R["Request for a resource"] -->|"look in the cache"| C{"Stored copy?"}
+  C -->|"no"| N["Fetch from the network and store it"]
+  C -->|"yes"| F{"Still fresh (max-age not passed)?"}
+  F -->|"yes"| U["Use the copy, no network at all"]
+  F -->|"no"| V{"Has ETag or Last-Modified?"}
+  V -->|"no"| N
+  V -->|"yes"| Q["Send a conditional request"]
+  Q -->|"304 Not Modified"| U2["Reuse the stored body"]
+  Q -->|"200 with new body"| N
+  </pre>
+  <figcaption>Browser cache decision: fresh, stale or revalidate</figcaption>
+</figure>
+<p>
+  Start at the top. A fresh copy costs nothing. A stale copy with a validator costs one small round trip. Only a missing copy costs a full download. <code>stale-while-revalidate</code> goes further: the browser shows the stale copy immediately and refreshes it in the background.
+</p>
+<table>
+  <caption>Cache-Control directives</caption>
+  <thead><tr><th>Directive</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>max-age=N</code></td><td>Fresh for N seconds without asking the server</td></tr>
+    <tr><td><code>no-cache</code></td><td>May store, but must revalidate before every reuse</td></tr>
+    <tr><td><code>no-store</code></td><td>Do not store at all (sensitive data)</td></tr>
+    <tr><td><code>private</code> / <code>public</code></td><td>Only the user's browser may store / shared caches (CDN) may store</td></tr>
+    <tr><td><code>s-maxage=N</code></td><td>Like <code>max-age</code> but for shared caches only</td></tr>
+    <tr><td><code>immutable</code></td><td>Will never change while fresh, so skip revalidation</td></tr>
+    <tr><td><code>stale-while-revalidate=N</code></td><td>May serve a stale copy for N more seconds while refreshing</td></tr>
+  </tbody>
+</table>
+<pre><code class="language-javascript" data-src="01-networking/express-cache.js"></code></pre>
+
+<aside class="callout common-mistake">
+  <p>Using <code>no-cache</code> when you mean <code>no-store</code>. <code>no-cache</code> still stores the response; it only forces revalidation. For private data that must never be written to a cache, use <code>no-store</code>.</p>
+</aside>
+
+<h3>Cookies and authorization headers</h3>
+<p>
+  Because HTTP is stateless, the server needs a way to recognise a returning user. A <strong>cookie</strong> is set by the server with <code>Set-Cookie</code> and then sent back by the browser automatically on matching requests. A token in the <code>Authorization</code> header is added by your code on each request. Cookies are sent automatically (convenient, but they need CSRF protection); header tokens are sent only when your code adds them. Full security is covered in a later chapter. <a class="figref" href="#fig-auth"></a> shows both.
+</p>
+<figure class="diagram" id="fig-auth">
+  <pre class="mermaid">
+sequenceDiagram
+  participant B as Browser
+  participant S as Server
+  B->>S: POST /login with credentials
+  S-->>B: 200 with Set-Cookie sid, HttpOnly, Secure, SameSite
+  B->>S: GET /api/me (browser adds Cookie sid)
+  B->>S: GET /api/data with Authorization Bearer token (your code adds it)
+  S-->>B: 200 for the authenticated user
+  </pre>
+  <figcaption>Cookie-based and header-based authentication</figcaption>
+</figure>
+<p>
+  The cookie flags matter: <code>HttpOnly</code> hides it from JavaScript, <code>Secure</code> sends it only over HTTPS, and <code>SameSite</code> limits cross-site sending.
+</p>
+<pre><code class="language-javascript">// Server (Express): the session cookie cannot be read by scripts and is HTTPS-only.
+res.cookie('sid', sessionId, { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 60 * 60 * 1000 });
+
+// Client: cookies on cross-origin calls need credentials: 'include' (and matching CORS headers).
+fetch('https://api.example.com/me', { credentials: 'include' });
+
+// Client: a bearer token is added explicitly.
+fetch('/api/data', { headers: { Authorization: `Bearer ${accessToken}` } });</code></pre>
+
+<h3>CORS and preflight requests</h3>
+<p>
+  Browsers apply the <strong>same-origin policy</strong>: a page may not read responses from another origin (a different scheme, host or port) unless that server opts in with <strong>CORS</strong> headers. Simple requests (for example a <code>GET</code> with safe headers) are sent directly, and the browser checks the response headers. Anything else (a <code>PUT</code>, <code>DELETE</code>, JSON <code>Content-Type</code> or an <code>Authorization</code> header) first triggers a <strong>preflight</strong>: an automatic <code>OPTIONS</code> request asking whether the real request is allowed. Preflight exists to protect older servers that never expected such requests from a web page (<a class="figref" href="#fig-cors"></a>).
+</p>
+<figure class="diagram" id="fig-cors">
+  <pre class="mermaid">
+sequenceDiagram
+  participant B as Browser at app.example.com
+  participant A as API at api.example.com
+  alt Simple request
+    B->>A: GET /data with Origin app.example.com
+    A-->>B: 200 with Access-Control-Allow-Origin
+  else Preflight needed
+    B->>A: OPTIONS with Access-Control-Request-Method and -Headers
+    A-->>B: 204 with Allow-Methods, Allow-Headers and Max-Age
+    B->>A: The real PUT request with Origin
+    A-->>B: 200 with Access-Control-Allow-Origin
+  end
+  </pre>
+  <figcaption>CORS: simple request versus preflighted request</figcaption>
+</figure>
+<p>
+  The preflight answer can be cached with <code>Access-Control-Max-Age</code>, which saves a round trip; browsers cap the value (Chromium at 2 hours, Firefox at 24 hours). CORS is enforced by the browser, not the server: curl and other servers ignore it, so it is not an authentication mechanism.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/express-cors.js"></code></pre>
+
+<h3>HTTP/1.1, HTTP/2 and HTTP/3</h3>
+<p>
+  <strong>HTTP/1.1</strong> sends one request at a time per connection, so browsers open about six connections per host and a slow response blocks the ones behind it (<em>head-of-line blocking</em> at the HTTP level). <strong>HTTP/2</strong> adds <strong>multiplexing</strong>: many streams share one TCP connection as interleaved frames, plus header compression. But one lost TCP segment still stalls all streams. <strong>HTTP/3</strong> runs on QUIC over UDP, so streams recover from loss independently, and it connects faster by merging the transport and TLS handshakes. <a class="figref" href="#fig-http-versions"></a> compares them.
+</p>
+<figure class="diagram" id="fig-http-versions">
+  <pre class="mermaid">
+flowchart LR
+  subgraph V1["HTTP/1.1 over TCP"]
+    A1["Request 1"] -->|"must finish first"| A2["Request 2"]
+  end
+  subgraph V2["HTTP/2 over TCP"]
+    B1["Stream 1"] -->|"interleaved frames"| B3["One TCP connection"]
+    B2["Stream 2"] -->|"interleaved frames"| B3
+  end
+  subgraph V3["HTTP/3 over QUIC"]
+    C1["Stream 1"] -->|"loss recovered per stream"| C3["One QUIC connection on UDP"]
+    C2["Stream 2"] -->|"loss recovered per stream"| C3
+  end
+  </pre>
+  <figcaption>Request handling in HTTP/1.1, HTTP/2 and HTTP/3</figcaption>
+</figure>
+<p>
+  Reading left to right, each version removes one waiting point. A practical consequence: HTTP/1.1-era tricks (domain sharding, giant sprite sheets, bundling everything) can hurt under HTTP/2 and HTTP/3. Use the snippet to see which version your pages use.
+</p>
+<pre><code class="language-javascript">// Run in the browser console: 'http/1.1', 'h2' (HTTP/2) or 'h3' (HTTP/3) for each request.
+performance.getEntriesByType('resource').forEach((r) => console.log(r.nextHopProtocol, r.name));</code></pre>
+
+<!-- ======================================================================= 1.5 -->
+<h2>Communication protocols for real-time updates</h2>
+<p class="overview">Plain HTTP only lets the client ask. This topic covers five ways to get fresh data to the screen, from repeated asking to a permanent two-way channel, and the engineering needed to keep them alive.</p>
+
+<h3>Short polling</h3>
+<p>
+  The client asks the server for updates on a timer, for example every 5 seconds. It is the simplest technique: plain HTTP, works everywhere, easy to cache and debug. The cost is waste and delay. Most answers say "nothing new", and a change can wait up to one full interval before the user sees it (<a class="figref" href="#fig-short-poll"></a>).
+</p>
+<figure class="diagram" id="fig-short-poll">
+  <pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  loop Every 5 seconds
+    C->>S: GET /status
+    S-->>C: 200 with the current state
+  end
+  </pre>
+  <figcaption>Short polling</figcaption>
+</figure>
+<p>
+  Every loop pays a full request, including headers, even when nothing changed. Use it when updates are rare, a few seconds of delay is fine and simplicity matters most.
+</p>
+<pre><code class="language-javascript">// The simplest possible poller. Pause it when the tab is hidden to save requests.
+async function poll() {
+  if (document.hidden) return;
+  const res = await fetch('/api/status');
+  render(await res.json());
+}
+setInterval(poll, 5000);</code></pre>
+
+<h3>Long polling</h3>
+<p>
+  In long polling the server holds the request open until it has something to say, or until a timeout (often 20 to 60 seconds). The client then immediately sends the next request. Updates arrive almost instantly, and the server sends nothing when nothing changes. The cost is one open connection per client and a new request after every message (<a class="figref" href="#fig-long-poll"></a>).
+</p>
+<figure class="diagram" id="fig-long-poll">
+  <pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: GET /updates since version 7
+  Note over S: Server holds the request open
+  S-->>C: 200 with version 8 when data changes
+  C->>S: GET /updates since version 8 (immediately)
+  Note over S: Server holds again, or answers 204 on timeout
+  </pre>
+  <figcaption>Long polling</figcaption>
+</figure>
+<p>
+  The version number in the request lets the server answer at once if the client missed something while reconnecting. The script below runs both techniques against a local server that changes every 1.5 seconds.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/polling.js"></code></pre>
+
+<h3>Server-Sent Events (SSE)</h3>
+<p>
+  SSE keeps one HTTP response open and streams text events from the server to the browser. It is one-way (server to client), uses plain HTTP, and the browser's <code>EventSource</code> API reconnects automatically and sends <code>Last-Event-ID</code> so the server can resume. This is the <strong>Observer / Pub-Sub</strong> pattern: clients subscribe to a stream and the server publishes events to every subscriber (<a class="figref" href="#fig-sse"></a>).
+</p>
+<figure class="diagram" id="fig-sse">
+  <pre class="mermaid">
+sequenceDiagram
+  participant C as Browser EventSource
+  participant S as Server
+  C->>S: GET /events with Accept text/event-stream
+  S-->>C: 200, stream stays open
+  S-->>C: id 1, event tick, data payload
+  S-->>C: id 2, event tick, data payload
+  Note over C,S: Connection drops
+  C->>S: GET /events with Last-Event-ID 2 (automatic)
+  </pre>
+  <figcaption>Server-Sent Events with automatic resume</figcaption>
+</figure>
+<p>
+  Limits: text only, server to client only, and over HTTP/1.1 browsers allow about six connections per domain across all tabs, so several SSE streams can starve other requests (HTTP/2 raises this, with 100 streams as a common default). Cookies and headers work normally, but the native <code>EventSource</code> cannot set custom headers.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/sse-server.js"></code></pre>
+<pre><code class="language-javascript" data-src="01-networking/sse-client.js"></code></pre>
+
+<h3>WebSockets</h3>
+<p>
+  A <strong>WebSocket</strong> starts as an HTTP request with an <code>Upgrade</code> header; if the server agrees (status 101), the same TCP connection switches to a full-duplex message protocol. Both sides can send at any time, with very small frame overhead. It suits chat, games, collaborative editing and trading screens (<a class="figref" href="#fig-ws"></a>).
+</p>
+<figure class="diagram" id="fig-ws">
+  <pre class="mermaid">
+sequenceDiagram
+  participant C as Browser
+  participant S as Server
+  C->>S: GET /socket with Upgrade websocket
+  S-->>C: 101 Switching Protocols
+  C->>S: message from the client
+  S-->>C: message from the server
+  S-->>C: another server message, no request needed
+  C->>S: close frame
+  </pre>
+  <figcaption>WebSocket upgrade and two-way messages</figcaption>
+</figure>
+<p>
+  Unlike HTTP, a WebSocket is stateful: the server must remember every open connection, and you must write your own reconnect, heartbeat and message-format logic. Its lifecycle is shown in <a class="figref" href="#fig-ws-states"></a>.
+</p>
+<figure class="diagram" id="fig-ws-states">
+  <pre class="mermaid">
+stateDiagram-v2
+  [*] --> CONNECTING : new WebSocket
+  CONNECTING --> OPEN : handshake succeeds
+  CONNECTING --> CLOSED : handshake fails
+  OPEN --> CLOSING : close called
+  OPEN --> CLOSED : network drop or server closes
+  CLOSING --> CLOSED : close handshake done
+  CLOSED --> CONNECTING : reconnect after backoff
+  </pre>
+  <figcaption>WebSocket connection states (readyState 0 to 3)</figcaption>
+</figure>
+<p>
+  The browser reports these as <code>readyState</code> values 0 (connecting), 1 (open), 2 (closing) and 3 (closed). The last arrow is not built in: reconnecting is your job. Share one socket for the whole app instead of one per component. That is the <strong>Singleton</strong> pattern, applied to a connection.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/ws-server.js"></code></pre>
+<pre><code class="language-javascript" data-src="01-networking/ws-client.js"></code></pre>
+
+<h3>WebRTC</h3>
+<p>
+  <strong>WebRTC</strong> connects two browsers directly (peer to peer) for audio, video and arbitrary data, usually over UDP. It needs a <strong>signaling</strong> channel (often a WebSocket) to exchange connection offers, and <strong>STUN/TURN</strong> servers to find a path through home routers (NAT): STUN discovers your public address, and TURN relays traffic when a direct path is impossible. It is built for low latency and tolerates packet loss, which is why video calls use it. It is heavy for simple data pushing (<a class="figref" href="#fig-webrtc"></a>).
+</p>
+<figure class="diagram" id="fig-webrtc">
+  <pre class="mermaid">
+sequenceDiagram
+  participant A as Peer A
+  participant G as Signaling server
+  participant B as Peer B
+  participant T as STUN and TURN
+  A->>T: What is my public address?
+  A->>G: Offer (media and address details)
+  G->>B: Offer relayed
+  B->>G: Answer
+  G->>A: Answer relayed
+  A->>B: Direct media and data (via TURN if direct fails)
+  </pre>
+  <figcaption>WebRTC setup through a signaling server</figcaption>
+</figure>
+<p>
+  The signaling server only introduces the peers; once connected, the media bypasses it. Use WebRTC for calls and peer-to-peer data; use a WebSocket for ordinary client-to-server messaging.
+</p>
+<pre><code class="language-javascript">// Browser: create a data channel and an offer. Sending the offer through your signaling channel is left out.
+const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+const channel = pc.createDataChannel('chat');
+channel.onopen = () => channel.send('hello peer');
+channel.onmessage = (e) => console.log('peer says:', e.data);
+const offer = await pc.createOffer();
+await pc.setLocalDescription(offer);   // then send `offer` to the other peer through signaling</code></pre>
+
+<h3>Reconnection, heartbeats, backoff with jitter, ordering and delivery guarantees</h3>
+<p>
+  Long-lived connections will drop: phones switch networks, laptops sleep, proxies close idle sockets. A <strong>heartbeat</strong> (a small ping and pong at a fixed interval) detects a dead connection that the OS has not noticed. After a drop, retry with <strong>exponential backoff</strong> (wait longer after each failure) and <strong>jitter</strong> (randomise the wait). Without jitter, thousands of clients reconnect at the same instant after a server restart and knock it over again. This is the <strong>Retry with backoff</strong> pattern (<a class="figref" href="#fig-reconnect"></a>).
+</p>
+<figure class="diagram" id="fig-reconnect">
+  <pre class="mermaid">
+flowchart TD
+  A["Connection lost"] -->|"close event or missed pong"| B["Wait a random time up to min of cap and base times 2 to the attempt"]
+  B -->|"timer fires"| C["Try to connect"]
+  C -->|"fails, attempt plus one"| B
+  C -->|"succeeds, attempt reset to 0"| D["Resume from the last seen sequence number"]
+  D -->|"server replays missed messages"| E["Back to normal"]
+  </pre>
+  <figcaption>Reconnect loop with backoff, jitter and resume</figcaption>
+</figure>
+<p>
+  The resume step is what makes the loop correct. Give every server message an increasing sequence number; the client remembers the last one it processed and asks for everything after it. Delivery guarantees follow: <strong>at-most-once</strong> (may lose messages), <strong>at-least-once</strong> (may duplicate, so the client must ignore duplicates), and "exactly-once" in practice, which is at-least-once plus idempotent handling. The <code>ws-client.js</code> file above implements the loop and heartbeat; the snippet below adds duplicate and gap handling.
+</p>
+<pre><code class="language-javascript">let lastSeq = 0;
+function handle(msg) {
+  if (msg.seq &lt;= lastSeq) return;                  // duplicate or replay: ignore (idempotent handling)
+  if (msg.seq !== lastSeq + 1) requestReplay(lastSeq); // gap detected: ask the server for what was missed
+  lastSeq = msg.seq;
+  render(msg);
+}</code></pre>
+
+<h3>Scaling concerns at a high level</h3>
+<p>
+  Real-time connections are long-lived, so capacity is counted in open connections, not requests per second. Each one uses memory and a file descriptor on the server. When you run several socket servers, a message received by server 1 must also reach clients connected to server 2. The usual answer is a <strong>Pub/Sub broker</strong> (such as Redis or a message queue): each server publishes incoming messages and subscribes to messages for its own clients. This is <strong>fan-out</strong> (<a class="figref" href="#fig-scale-ws"></a>).
+</p>
+<figure class="diagram" id="fig-scale-ws">
+  <pre class="mermaid">
+flowchart LR
+  C["Many clients"] -->|"long-lived connections"| LB["Load balancer"]
+  LB -->|"route a connection"| S1["Socket server 1"]
+  LB -->|"route a connection"| S2["Socket server 2"]
+  S1 -->|"publish message"| B["Pub/Sub broker"]
+  B -->|"fan-out to subscribers"| S2
+  </pre>
+  <figcaption>Scaling WebSocket servers with a Pub/Sub broker</figcaption>
+</figure>
+<p>
+  Without the broker, users on different servers could not talk to each other. <strong>Sticky sessions</strong> (the load balancer keeps a client on one server) are needed only by libraries that fall back to polling. Also plan for rolling deploys: closing a server drops thousands of sockets at once, which is where jittered reconnects pay off.
+</p>
+<aside class="callout common-mistake">
+  <p>Opening one WebSocket or EventSource per component. Ten widgets become ten connections, and over HTTP/1.1 the browser's six-connection limit can block ordinary requests. Share one connection and fan out events inside the app.</p>
+</aside>
+
+<!-- ======================================================================= 1.6 -->
+<h2>REST APIs</h2>
+<p class="overview">REST is the default style for web APIs: resources named by URLs, acted on with HTTP methods. This topic covers how to design the URLs, pages, filters and versions well, and where REST falls short.</p>
+
+<h3>Resource modeling and URL design</h3>
+<p>
+  REST models the system as <strong>resources</strong> (nouns) such as users and posts, each with a stable URL. Methods supply the verbs. Collections are plural (<code>/users</code>), one item is addressed by id (<code>/users/42</code>), and relationships are nested only one level deep (<code>/users/42/posts</code>). Avoid verbs in paths such as <code>/getUser</code>. <a class="figref" href="#fig-rest-map"></a> shows a resource map.
+</p>
+<figure class="diagram" id="fig-rest-map">
+  <pre class="mermaid">
+flowchart LR
+  U["/users"] -->|"one item by id"| U1["/users/42"]
+  U1 -->|"has many"| P["/users/42/posts"]
+  P -->|"one item by id"| P1["/posts/9"]
+  P1 -->|"has many"| C["/posts/9/comments"]
+  </pre>
+  <figcaption>A REST resource map</figcaption>
+</figure>
+<p>
+  Once a post has its own top-level URL (<code>/posts/9</code>), clients do not need to know its owner to fetch it. This keeps URLs short and stable.
+</p>
+
+<h3>Methods and status codes in practice</h3>
+<p>
+  Map actions to methods consistently: <code>GET</code> reads, <code>POST</code> creates, <code>PUT</code> replaces, <code>PATCH</code> changes part, <code>DELETE</code> removes. Return the status that matches the outcome: <code>201 Created</code> with a <code>Location</code> header for a new resource, <code>204</code> when there is nothing to return, <code>404</code> for a missing resource, <code>422</code> for validation errors. Clients then need no guessing (<a class="figref" href="#fig-rest-crud"></a>).
+</p>
+<figure class="diagram" id="fig-rest-crud">
+  <pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: POST /posts with a JSON body
+  S-->>C: 201 Created, Location /posts/9
+  C->>S: PUT /posts/9 with the full replacement
+  S-->>C: 200 OK with the updated post
+  C->>S: DELETE /posts/9
+  S-->>C: 204 No Content
+  </pre>
+  <figcaption>Create, replace and delete in a REST API</figcaption>
+</figure>
+<p>
+  Each reply tells the client what to do next without reading the body: store the new URL, show the update, remove the row.
+</p>
+
+<h3>Idempotency</h3>
+<p>
+  Networks fail between the server finishing the work and the client receiving the answer, so clients retry. For <code>PUT</code> and <code>DELETE</code> that is harmless. For <code>POST</code> it creates a duplicate order or a double charge. The fix is an <strong>idempotency key</strong>: the client generates a unique key per user action and sends it in a header; the server stores the first result under that key and returns it for any repeat (<a class="figref" href="#fig-idempotency"></a>).
+</p>
+<figure class="diagram" id="fig-idempotency">
+  <pre class="mermaid">
+flowchart TD
+  R["POST with Idempotency-Key abc-1"] -->|"server checks its store"| K{"Key seen before?"}
+  K -->|"no"| W["Do the work and save the result under the key"]
+  K -->|"yes"| S["Return the saved result, do no work"]
+  W -->|"respond"| A["201 Created"]
+  S -->|"respond"| B["Same response as the first time"]
+  </pre>
+  <figcaption>Making POST safe to retry with an idempotency key</figcaption>
+</figure>
+<p>
+  Generate the key when the user clicks, not when the request is sent, so every automatic retry reuses it. The script compares plain <code>POST</code>, <code>PUT</code> and <code>POST</code> with a key.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/rest-idempotency.js"></code></pre>
+
+<h3>Pagination: offset and cursor</h3>
+<p>
+  Never return an unbounded list. <strong>Offset pagination</strong> (<code>?offset=20&amp;limit=10</code>) is easy and allows jumping to page N, but the database must skip rows (slow for deep pages) and the pages shift if items are inserted or removed while the user browses. <strong>Cursor pagination</strong> (<code>?after=abc&amp;limit=10</code>) asks for "items after this one": it stays fast and stable, but you cannot jump to an arbitrary page. Infinite scroll and feeds should use cursors (<a class="figref" href="#fig-pagination"></a>).
+</p>
+<figure class="diagram" id="fig-pagination">
+  <pre class="mermaid">
+flowchart LR
+  subgraph OFF["Offset pagination"]
+    O1["Page 1: offset 0, limit 10"] -->|"new item inserted at the top"| O2["Page 2: offset 10"]
+    O2 -->|"result"| O3["Repeats the last item of page 1"]
+  end
+  subgraph CUR["Cursor pagination"]
+    C1["Page 1 ends at id 10"] -->|"new item inserted at the top"| C2["Page 2: after id 10"]
+    C2 -->|"result"| C3["No repeat, no gap"]
+  end
+  </pre>
+  <figcaption>Offset versus cursor pagination when data changes</figcaption>
+</figure>
+<p>
+  The cursor is a bookmark, so it does not care how many rows were inserted before it. The server returns <code>nextCursor</code>, and the client keeps following it until it is <code>null</code>.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/rest-pagination.js"></code></pre>
+
+<h3>Filtering, sorting and versioning</h3>
+<p>
+  Express filters, sorting and page size as query parameters on the collection: <code>/posts?status=published&amp;sort=-createdAt&amp;limit=20</code>. Validate and whitelist them on the server. <strong>Versioning</strong> lets you change the API without breaking old clients. The common choices are a path prefix (<code>/v1/posts</code>, simple and visible), a header or media type (cleaner URLs, harder to test in a browser), or no explicit version with only additive changes (new fields are fine, removals are not). <a class="figref" href="#fig-rest-query"></a> shows how one URL is read.
+</p>
+<figure class="diagram" id="fig-rest-query">
+  <pre class="mermaid">
+flowchart LR
+  U["GET /v1/posts?status=published&amp;sort=-createdAt&amp;limit=20"] -->|"path prefix"| V["Version v1"]
+  U -->|"collection"| R["Resource posts"]
+  U -->|"query"| F["Filter status is published"]
+  U -->|"query"| S["Sort newest first, page size 20"]
+  </pre>
+  <figcaption>Reading a REST request URL</figcaption>
+</figure>
+<p>
+  A leading minus sign for descending order is a common convention, not a standard, so document whichever style your API uses. Build query strings with <code>URLSearchParams</code> so values are encoded correctly.
+</p>
+<pre><code class="language-javascript">const params = new URLSearchParams({ status: 'published', sort: '-createdAt', limit: '20' });
+const res = await fetch(`/api/v1/posts?${params}`); // encodes special characters for you</code></pre>
+
+<h3>Over-fetching and under-fetching</h3>
+<p>
+  <strong>Over-fetching</strong> means a response carries more fields than the screen needs, which wastes bytes on mobile networks. <strong>Under-fetching</strong> means one endpoint is not enough, so the client chains several requests (a user, then their posts, then each post's comments) and pays a round trip for each. Both come from fixed server-defined response shapes (<a class="figref" href="#fig-fetching"></a>). They are the main reason GraphQL and backend-for-frontend layers exist.
+</p>
+<figure class="diagram" id="fig-fetching">
+  <pre class="mermaid">
+flowchart LR
+  subgraph OVER["Over-fetching"]
+    A1["GET /users/42"] -->|"returns 40 fields"| A2["Screen shows 2 of them"]
+  end
+  subgraph UNDER["Under-fetching"]
+    B1["GET /users/42"] -->|"then"| B2["GET /users/42/posts"]
+    B2 -->|"then"| B3["GET /posts/9/comments"]
+  end
+  </pre>
+  <figcaption>Over-fetching and under-fetching in REST</figcaption>
+</figure>
+<p>
+  Mitigations inside REST: sparse fieldsets (<code>?fields=id,name</code>), an <code>?include=posts</code> parameter, or an endpoint shaped for one screen.
+</p>
+
+<h3>HATEOAS (briefly)</h3>
+<p>
+  <strong>HATEOAS</strong> (hypermedia as the engine of application state) means responses include links to the actions available next, so the client follows links instead of building URLs. It is the top level of strict REST, but most public APIs skip it and publish documentation instead. It is useful for workflows where the allowed actions depend on state, such as an order that can be paid or cancelled (<a class="figref" href="#fig-hateoas"></a>).
+</p>
+<figure class="diagram" id="fig-hateoas">
+  <pre class="mermaid">
+flowchart LR
+  C["Client"] -->|"GET /orders/7"| S["Server"]
+  S -->|"200 with links: pay and cancel"| C
+  C -->|"follows the pay link"| P["POST /orders/7/payment"]
+  </pre>
+  <figcaption>Following links returned by the server</figcaption>
+</figure>
+<p>
+  The client never hard-codes the payment URL; if the order were already paid, the server would simply omit the <code>pay</code> link.
+</p>
+<pre><code class="language-json">{
+  "id": 7,
+  "status": "pending",
+  "links": {
+    "self":   { "href": "/orders/7", "method": "GET" },
+    "pay":    { "href": "/orders/7/payment", "method": "POST" },
+    "cancel": { "href": "/orders/7", "method": "DELETE" }
+  }
+}</code></pre>
+
+<!-- ======================================================================= 1.7 -->
+<h2>GraphQL</h2>
+<p class="overview">GraphQL lets the client describe exactly the data it needs in one request. This topic explains its building blocks, what it fixes, and the costs that come with it.</p>
+
+<h3>Schema, queries, mutations and subscriptions</h3>
+<p>
+  A GraphQL server publishes a typed <strong>schema</strong>: the contract of every type and field. Clients send one of three <strong>operations</strong>. A <strong>query</strong> reads data. A <strong>mutation</strong> writes data. A <strong>subscription</strong> receives pushed events, usually over a WebSocket (<a class="figref" href="#fig-gql-ops"></a>). Because the schema is typed and introspectable, tools can validate queries and generate client types before the code runs.
+</p>
+<figure class="diagram" id="fig-gql-ops">
+  <pre class="mermaid">
+flowchart LR
+  SC["Schema: types and fields"] -->|"defines reads"| Q["Query"]
+  SC -->|"defines writes"| M["Mutation"]
+  SC -->|"defines pushed events"| SU["Subscription"]
+  Q -->|"request and response"| H["HTTP POST"]
+  SU -->|"long-lived stream"| W["WebSocket"]
+  </pre>
+  <figcaption>The three GraphQL operation types</figcaption>
+</figure>
+<p>
+  Queries and mutations travel over ordinary HTTP; only subscriptions need a persistent connection. The schema below declares one of each.
+</p>
+<pre><code class="language-graphql" data-src="01-networking/schema.graphql"></code></pre>
+
+<h3>Solving over-fetching and under-fetching</h3>
+<p>
+  The client names the fields it wants, so the response has exactly those fields (no over-fetching), and related data can be requested in the same query (no chain of calls, so no under-fetching). On slow mobile networks, one round trip instead of three is a clear win. <a class="figref" href="#fig-rest-vs-gql"></a> compares the two flows for the same screen.
+</p>
+<figure class="diagram" id="fig-rest-vs-gql">
+  <pre class="mermaid">
+flowchart LR
+  subgraph RESTWAY["REST: three round trips"]
+    R1["GET /users/42"] -->|"then"| R2["GET /users/42/posts"]
+    R2 -->|"then"| R3["GET /posts/9/comments"]
+  end
+  subgraph GQLWAY["GraphQL: one round trip"]
+    G1["POST /graphql with one query"] -->|"server resolves all fields"| G2["Exactly the requested data"]
+  end
+  </pre>
+  <figcaption>The same screen loaded with REST and with GraphQL</figcaption>
+</figure>
+<p>
+  The saving is real when round trips dominate. If your REST endpoints are already shaped for the screens, the gain is smaller.
+</p>
+
+<h3>The costs: caching, complexity, N+1 and persisted queries</h3>
+<p>
+  GraphQL moves work to the server and removes some of HTTP's free features.
+</p>
+<ul>
+  <li><strong>Caching:</strong> every request is a <code>POST</code> to one URL, so browsers and CDNs cannot cache by URL. Clients keep a normalised cache by object id instead; <strong>persisted queries</strong> (send a hash, not the text) allow <code>GET</code> and CDN caching.</li>
+  <li><strong>Query complexity:</strong> a client can ask for deeply nested data. Servers limit query depth and cost, and time out expensive queries.</li>
+  <li><strong>The N+1 problem:</strong> resolving a list of 20 posts and each author can cause 1 query for the posts plus 20 for the authors. A <strong>batching</strong> layer (the DataLoader pattern) collects the 20 author lookups into one.</li>
+  <li><strong>Errors:</strong> a response can be HTTP 200 and still contain an <code>errors</code> array, so monitoring must look inside the body.</li>
+</ul>
+<figure class="diagram" id="fig-n-plus-one">
+  <pre class="mermaid">
+flowchart TD
+  Q["Query: 20 posts with their authors"] -->|"1 query"| P["Load 20 posts"]
+  P -->|"naive: 20 queries"| A1["Load author for each post"]
+  P -->|"batched: 1 query"| A2["Load all authors at once"]
+  </pre>
+  <figcaption>The N+1 problem and its batched fix</figcaption>
+</figure>
+<p>
+  <a class="figref" href="#fig-n-plus-one"></a> shows the two paths from the same list: one query per item, or one query for all items. This is a server problem, but you will be asked about it because it explains why a "simple" GraphQL query can be slow.
+</p>
+
+<h3>How a frontend client talks to GraphQL</h3>
+<p>
+  The client sends one <code>POST</code> to a single endpoint (commonly <code>/graphql</code>) with a JSON body holding a <code>query</code> string and a <code>variables</code> object. Variables keep the query text constant, which helps caching and avoids string building. <strong>Fragments</strong> let components declare the fields they need and share them. Libraries such as Apollo Client or urql add caching and hooks, but the wire format is just HTTP and JSON (<a class="figref" href="#fig-gql-flow"></a>).
+</p>
+<figure class="diagram" id="fig-gql-flow">
+  <pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant G as GraphQL server
+  participant D as Data sources
+  C->>G: POST /graphql with query and variables
+  G->>G: Validate the query against the schema
+  G->>D: Resolvers fetch the requested fields
+  D-->>G: Data
+  G-->>C: 200 with data and optionally errors
+  </pre>
+  <figcaption>One GraphQL request from client to data sources</figcaption>
+</figure>
+<p>
+  Validation happens before any data is fetched, so malformed queries fail fast. The script below sends a query with variables to a small mock server.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/graphql-query.js"></code></pre>
+
+<!-- ======================================================================= 1.8 -->
+<h2>gRPC</h2>
+<p class="overview">gRPC is a fast, strictly typed way for services to call each other. This topic explains how it works, why browsers cannot use it directly, and where it belongs in a frontend architecture.</p>
+
+<h3>Protocol Buffers and HTTP/2 transport</h3>
+<p>
+  You describe the API in a <code>.proto</code> file: messages (data shapes) and services (callable methods). A compiler generates typed client and server code in many languages. Messages travel as compact <strong>Protocol Buffers</strong> binary over <strong>HTTP/2</strong>, so they are smaller and faster to parse than JSON, and HTTP/2 gives multiplexing and streaming (<a class="figref" href="#fig-grpc-build"></a>). The cost is that binary payloads are not human-readable in DevTools.
+</p>
+<figure class="diagram" id="fig-grpc-build">
+  <pre class="mermaid">
+flowchart LR
+  P["chat.proto contract"] -->|"protoc generates"| CS["Client stub"]
+  P -->|"protoc generates"| SS["Server skeleton"]
+  CS -->|"binary protobuf over HTTP/2"| SS
+  </pre>
+  <figcaption>From a .proto contract to a working call</figcaption>
+</figure>
+<p>
+  Both sides compile from the same file, so a field renamed on one side is a compile error on the other. Field numbers (not names) identify data on the wire, so you can add fields without breaking old clients.
+</p>
+<pre><code class="language-protobuf" data-src="01-networking/chat.proto"></code></pre>
+
+<h3>The four call types</h3>
+<p>
+  gRPC has four shapes of call. <strong>Unary</strong>: one request, one response, like a normal function call. <strong>Server streaming</strong>: one request, a stream of responses (a live feed). <strong>Client streaming</strong>: a stream of requests, one response (uploading chunks). <strong>Bidirectional streaming</strong>: both sides stream independently (chat). <a class="figref" href="#fig-grpc-types"></a> shows each.
+</p>
+<figure class="diagram" id="fig-grpc-types">
+  <pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  Note over C,S: 1 Unary
+  C->>S: Request
+  S-->>C: Response
+  Note over C,S: 2 Server streaming
+  C->>S: Request
+  S-->>C: Response 1, 2, 3 ...
+  Note over C,S: 3 Client streaming
+  C->>S: Request 1, 2, 3 ...
+  S-->>C: One response
+  Note over C,S: 4 Bidirectional streaming
+  C->>S: Messages at any time
+  S-->>C: Messages at any time
+  </pre>
+  <figcaption>The four gRPC call types</figcaption>
+</figure>
+<p>
+  The first two are the ones web apps need most. Calls 3 and 4 need full control over HTTP/2 streams, which browsers do not give you (see the next section).
+</p>
+
+<h3>gRPC-Web and why browsers cannot call gRPC directly</h3>
+<p>
+  gRPC relies on HTTP/2 features that browser APIs do not expose: fine control over frames, and <strong>trailers</strong> (headers sent after the body, where gRPC puts its final status). <code>fetch</code> and XHR hide these details. <strong>gRPC-Web</strong> is a variant that fits inside what browsers can do: the status is encoded in the body, and a <strong>proxy</strong> (commonly Envoy, or a server with built-in support) translates between gRPC-Web and real gRPC. It supports unary and server-streaming calls; client and bidirectional streaming are not available from the browser (<a class="figref" href="#fig-grpc-web"></a>).
+</p>
+<figure class="diagram" id="fig-grpc-web">
+  <pre class="mermaid">
+flowchart LR
+  B["Browser with gRPC-Web client"] -->|"gRPC-Web over HTTP"| P["Proxy such as Envoy"]
+  P -->|"native gRPC over HTTP/2"| S["gRPC server"]
+  S -->|"response and trailers"| P
+  P -->|"status encoded in the body"| B
+  </pre>
+  <figcaption>The gRPC-Web proxy translating between browser and server</figcaption>
+</figure>
+<p>
+  Every extra hop adds operations work, which is a main reason frontends often call REST or GraphQL while services call each other with gRPC. Alternatives that work in browsers without a translating proxy, such as the Connect protocol, exist; check current support before choosing (VERIFY).
+</p>
+<aside class="callout interview-tip">
+  <p>The one-line answer to "why can't browsers call gRPC": the browser APIs do not expose HTTP/2 frames or trailers, which gRPC needs, so gRPC-Web plus a proxy is required.</p>
+</aside>
+
+<h3>Where gRPC fits and where it does not</h3>
+<p>
+  gRPC shines <strong>between backend services</strong>: strict contracts, small payloads, low latency, streaming, code generation in many languages. It fits poorly on the public edge: browsers need a proxy, payloads are not easy to inspect, and public developers expect REST. The common design uses REST or GraphQL to the browser, and gRPC behind a gateway or BFF (<a class="figref" href="#fig-grpc-fit"></a>).
+</p>
+<figure class="diagram" id="fig-grpc-fit">
+  <pre class="mermaid">
+flowchart LR
+  B["Browser"] -->|"REST or GraphQL over HTTPS"| G["Gateway or BFF"]
+  G -->|"gRPC"| S1["Users service"]
+  G -->|"gRPC"| S2["Orders service"]
+  </pre>
+  <figcaption>gRPC inside the backend, REST or GraphQL at the browser edge</figcaption>
+</figure>
+<p>
+  The frontend team sees one friendly API; the backend teams keep their efficient internal protocol. The gateway is the translation point.
+</p>
+
+<!-- ======================================================================= 1.9 -->
+<h2>Choosing the right approach</h2>
+<p class="overview">Knowing each technology is half the skill; choosing between them is the interview. This topic gives decision flows for data APIs and for live updates, and the architecture that connects frontends to many services.</p>
+
+<h3>REST, GraphQL or gRPC</h3>
+<p>
+  Choose by who calls whom and what hurts most. Public or simple CRUD APIs with HTTP caching: REST. Many different clients and screens with varied data needs, or deep relationships: GraphQL. Service-to-service calls where speed and contracts matter: gRPC. <a class="figref" href="#fig-choose-api"></a> turns this into questions. The full comparison table is in the Trade-offs part of this chapter.
+</p>
+<figure class="diagram" id="fig-choose-api">
+  <pre class="mermaid">
+flowchart TD
+  Q1{"Caller is a browser or a third party?"} -->|"no, service to service"| GR["gRPC"]
+  Q1 -->|"yes"| Q2{"Do screens need very different slices of related data?"}
+  Q2 -->|"yes"| GQ["GraphQL, or a BFF per client"]
+  Q2 -->|"no"| RE["REST with HTTP caching"]
+  </pre>
+  <figcaption>Choosing an API style</figcaption>
+</figure>
+<p>
+  Notice that the first question is about the caller, not the technology. These styles also combine: a REST API for the public, GraphQL for your own apps and gRPC inside.
+</p>
+
+<h3>Polling, SSE or WebSocket</h3>
+<p>
+  For live updates, ask which direction data flows and how fast it changes. Updates that are rare and tolerate a delay: polling. Server-to-client only (notifications, tickers, progress): SSE. Frequent messages in both directions (chat, collaboration, games): WebSocket. <a class="figref" href="#fig-choose-live"></a> shows the path.
+</p>
+<figure class="diagram" id="fig-choose-live">
+  <pre class="mermaid">
+flowchart TD
+  A{"Do users need updates within a few seconds?"} -->|"no"| P["Short polling or refetch on focus"]
+  A -->|"yes"| B{"Does the client also send frequent messages?"}
+  B -->|"yes"| W["WebSocket"]
+  B -->|"no"| C{"Is the data only text, server to client?"}
+  C -->|"yes"| S["SSE"]
+  C -->|"no, binary or peer to peer"| W2["WebSocket or WebRTC"]
+  </pre>
+  <figcaption>Choosing a live-update technique</figcaption>
+</figure>
+<p>
+  SSE is the underused answer: it covers a large share of "live" features with less infrastructure than WebSockets. Reach for WebSocket when you truly need two-way traffic.
+</p>
+
+<h3>Backend-for-Frontend (BFF) and the API gateway</h3>
+<p>
+  An <strong>API gateway</strong> is a single entry point in front of many services. It handles shared concerns: routing, authentication, rate limiting, TLS. A <strong>Backend-for-Frontend</strong> is a small server owned by one frontend (web, iOS, Android). It calls the internal services and returns exactly what that client's screens need. The BFF is a <strong>Facade</strong> (one simple interface over many services) and an <strong>Adapter</strong> (it translates internal shapes into UI shapes). Because the frontend team owns it, they can change it without waiting for several backend teams (<a class="figref" href="#fig-bff"></a>).
+</p>
+<figure class="diagram" id="fig-bff">
+  <pre class="mermaid">
+flowchart LR
+  W["Web app"] -->|"one call per screen"| BW["Web BFF"]
+  M["Mobile app"] -->|"smaller payloads"| BM["Mobile BFF"]
+  BW -->|"parallel calls"| SV["Internal services"]
+  BM -->|"parallel calls"| SV
+  GW["API gateway"] -->|"auth and rate limits at the edge"| BW
+  </pre>
+  <figcaption>One BFF per client, in front of internal services</figcaption>
+</figure>
+<p>
+  Without a BFF, each client makes many calls and reshapes data itself. The cost is one more service to run and keep consistent. The script below merges two services into one response.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/bff.js"></code></pre>
+
+<!-- ======================================================================= 1.10 -->
+<h2>Frontend network resilience and efficiency</h2>
+<p class="overview">Networks are slow, flaky and sometimes absent. This topic covers the habits that keep an app usable anyway: bounded waiting, careful retries, fewer duplicate requests and honest behaviour offline.</p>
+
+<h3>Timeouts and request cancellation</h3>
+<p>
+  <code>fetch</code> has no default timeout, so a stalled request can wait for minutes. Always set a limit, and cancel work the user no longer needs, such as the previous search when they type again or a request for a screen they left. Use an <code>AbortController</code>: <code>abort()</code> makes the <code>fetch</code> promise reject, and the browser stops the request (<a class="figref" href="#fig-abort"></a>).
+</p>
+<figure class="diagram" id="fig-abort">
+  <pre class="mermaid">
+flowchart TD
+  S["Start request and start a timer"] -->|"response arrives first"| OK["Clear the timer and use the data"]
+  S -->|"timer fires"| T["controller.abort"]
+  S -->|"user leaves the screen"| T
+  T -->|"fetch rejects with an abort error"| H["Ignore it or show a timeout message"]
+  </pre>
+  <figcaption>A request with a timeout and manual cancellation</figcaption>
+</figure>
+<p>
+  Whichever path ends the request, clean up the timer. Handle the abort error separately from real failures so a cancelled request does not show an error to the user.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/fetch-timeout.js"></code></pre>
+<pre><code class="language-javascript">// React: cancel the request when the component unmounts or the id changes (avoids stale results).
+useEffect(() => {
+  const controller = new AbortController();
+  fetch(`/api/users/${id}`, { signal: controller.signal })
+    .then((res) => res.json())
+    .then(setUser)
+    .catch((err) => { if (err.name !== 'AbortError') setError(err); });
+  return () => controller.abort();
+}, [id]);</code></pre>
+
+<h3>Retries with exponential backoff and jitter</h3>
+<p>
+  Many failures are temporary, so retrying helps, but retrying badly makes outages worse. Retry only failures that can be transient (network errors, <code>429</code>, <code>5xx</code>) and only for requests that are safe to repeat. Wait <code>base x 2^attempt</code> up to a cap, and add jitter. Stop after a few attempts and show an error (<a class="figref" href="#fig-retry"></a>).
+</p>
+<figure class="diagram" id="fig-retry">
+  <pre class="mermaid">
+flowchart TD
+  R["Send request"] -->|"failure"| Q{"Retryable and attempts left?"}
+  Q -->|"no"| E["Give up and show an error"]
+  Q -->|"yes"| W["Wait random time up to base times 2 to the attempt"]
+  W -->|"timer fires"| R
+  R -->|"success"| OK["Return the data"]
+  </pre>
+  <figcaption>Retry with exponential backoff and jitter</figcaption>
+</figure>
+<p>
+  The loop in the figure is exactly what the code does: the retry condition is the diamond, the wait is the random delay. If the server sends a <code>Retry-After</code> header, use it instead of your own delay.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/retry-backoff.js"></code></pre>
+
+<h3>Request deduplication, batching, debounce and throttle</h3>
+<p>
+  The cheapest request is one you never send. <strong>Deduplication</strong>: if three components ask for the same URL at the same time, send one request and share the promise. <strong>Batching</strong>: combine many small requests (for example 20 ids) into one call. <strong>Debounce</strong>: wait until the user stops typing before calling. <strong>Throttle</strong>: allow at most one call per interval, for scroll or resize (<a class="figref" href="#fig-dedupe"></a>). Libraries such as TanStack Query and SWR do this for you.
+</p>
+<figure class="diagram" id="fig-dedupe">
+  <pre class="mermaid">
+flowchart LR
+  A["Component A asks for /api/me"] -->|"first caller"| M["In-flight map"]
+  B["Component B asks for /api/me"] -->|"finds the same key"| M
+  M -->|"one network call"| N["Server"]
+  N -->|"one response shared by both"| M
+  </pre>
+  <figcaption>Request deduplication with an in-flight map</figcaption>
+</figure>
+<p>
+  The in-flight map holds the pending promise per key, and removes it when the promise settles so later calls fetch fresh data. The script shows three callers producing one server hit, and five keystrokes producing one search.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/dedupe-debounce.js"></code></pre>
+
+<h3>Handling 429 and 5xx responses</h3>
+<p>
+  A <code>429 Too Many Requests</code> means you are over a rate limit: wait for the time in <code>Retry-After</code> (seconds or a date), do not hammer. A <code>5xx</code> means the server failed, which is often temporary: retry idempotent requests with backoff, and for <code>POST</code> only with an idempotency key. A <code>4xx</code> other than 429 means the request itself is wrong, so retrying cannot help (<a class="figref" href="#fig-error-handling"></a>).
+</p>
+<figure class="diagram" id="fig-error-handling">
+  <pre class="mermaid">
+flowchart TD
+  R["Response status"] -->|"429"| A["Wait for Retry-After, then retry"]
+  R -->|"500, 502, 503, 504"| B["Retry with backoff if the request is idempotent"]
+  R -->|"other 4xx"| C["Do not retry: show or fix the error"]
+  R -->|"401"| D["Refresh the token once, then retry"]
+  </pre>
+  <figcaption>What to do for each class of failure</figcaption>
+</figure>
+<p>
+  The 401 branch deserves care: refresh the token once and share that refresh between concurrent requests, otherwise ten failing calls start ten refreshes. The helper below reads <code>Retry-After</code> in both of its forms.
+</p>
+<pre><code class="language-javascript">// Retry-After is either a number of seconds or an HTTP date.
+function retryAfterMs(res) {
+  const v = res.headers.get('Retry-After');
+  if (!v) return null;
+  const seconds = Number(v);
+  return Number.isFinite(seconds) ? seconds * 1000 : Math.max(0, Date.parse(v) - Date.now());
+}</code></pre>
+
+<h3>Offline detection and graceful degradation</h3>
+<p>
+  <code>navigator.onLine</code> and the <code>online</code> and <code>offline</code> events tell you when the device has no network at all, but a "true" value does not prove the server is reachable. Treat failed requests as the real signal. Degrade gracefully: show cached data with a notice, queue user actions (such as sending a message) and replay them when the connection returns, and disable features that cannot work. <a class="figref" href="#fig-offline"></a> shows the states.
+</p>
+<figure class="diagram" id="fig-offline">
+  <pre class="mermaid">
+stateDiagram-v2
+  [*] --> Online : app starts with a connection
+  Online --> Offline : offline event or repeated failures
+  Offline --> Syncing : online event
+  Syncing --> Online : queue sent successfully
+  Syncing --> Offline : sync fails again
+  </pre>
+  <figcaption>Connectivity states of an offline-tolerant client</figcaption>
+</figure>
+<p>
+  The Syncing state matters: do not jump straight from offline to online, because queued actions must be sent first, in order, and may fail.
+</p>
+<pre><code class="language-javascript">const queue = [];                       // actions the user made while offline
+function send(action) {
+  if (!navigator.onLine) { queue.push(action); showBanner('Offline: will send when you reconnect'); return; }
+  return post(action);
+}
+window.addEventListener('online', async () => {
+  while (queue.length) await post(queue.shift()); // replay in order
+  hideBanner();
+});</code></pre>
+
+<h3>An API client layer (added topic)</h3>
+<p>
+  Instead of calling <code>fetch</code> in every component, put timeouts, auth headers, retries, error mapping and data reshaping in one module. This is a <strong>Facade</strong> (one simple interface over several concerns) and an <strong>Adapter</strong> (it converts the server's shape, such as <code>first_name</code>, into the UI's shape, such as <code>displayName</code>). When the API changes, you change one file (<a class="figref" href="#fig-api-client"></a>).
+</p>
+<figure class="diagram" id="fig-api-client">
+  <pre class="mermaid">
+flowchart LR
+  C["Components"] -->|"api.get and api.post"| F["API client facade"]
+  F -->|"adds auth, timeout, retry"| H["fetch"]
+  H -->|"raw response"| AD["Adapter: server shape to UI shape"]
+  AD -->|"clean view model"| C
+  </pre>
+  <figcaption>An API client layer between components and the network</figcaption>
+</figure>
+<p>
+  Components never see HTTP details. The same layer is also where you add logging, request ids and a global handler for expired sessions.
+</p>
+<pre><code class="language-javascript" data-src="01-networking/api-client.js"></code></pre>
+
+<!-- ======================================================================= 1.11 -->
+<h2>Protocol-choice workshop</h2>
+<p class="overview">Six realistic scenarios put the whole chapter to work. For each one, state the recommended approach, why it wins, and what you would watch out for. Practise saying these aloud.</p>
+
+<h3>Chat application</h3>
+<p>
+  <strong>Recommended: WebSocket</strong> (history over REST). Messages flow both ways, often and with low delay, so a persistent two-way channel fits. Load old messages with cursor pagination, send new ones over the socket, and add heartbeat, reconnect with resume by sequence number, and an idempotency id per message to avoid duplicates. Scale with a Pub/Sub broker behind several socket servers (<a class="figref" href="#fig-ws-chat"></a>).
+</p>
+<figure class="diagram" id="fig-ws-chat">
+  <pre class="mermaid">
+sequenceDiagram
+  participant A as Alice client
+  participant S as Chat server
+  participant B as Bob client
+  A->>S: GET /rooms/1/messages with a cursor (history)
+  A->>S: WebSocket message with client id
+  S-->>A: Ack with server sequence number
+  S-->>B: Push message with sequence number
+  </pre>
+  <figcaption>Chat: history over REST, live messages over a WebSocket</figcaption>
+</figure>
+<p>
+  The acknowledgement with a sequence number lets Alice mark the message as sent, and lets either client detect a gap after reconnecting.
+</p>
+
+<h3>Stock ticker</h3>
+<p>
+  <strong>Recommended: SSE or WebSocket, with server-side throttling.</strong> Prices flow from server to client only, so SSE is enough and simpler. Choose WebSocket if the user also sends subscriptions at high frequency or you need binary data. Do not render every tick: the server (or client) should <strong>coalesce</strong> updates to the latest price every 100 to 250 ms, since the eye cannot read faster (<a class="figref" href="#fig-ticker"></a>). Decide what happens on reconnect: usually send a fresh snapshot, not the missed ticks.
+</p>
+<figure class="diagram" id="fig-ticker">
+  <pre class="mermaid">
+flowchart LR
+  X["Price feed"] -->|"many ticks per second"| S["Server: keep only the latest per symbol"]
+  S -->|"one SSE event every 200 ms"| C["Browser"]
+  C -->|"update changed rows only"| UI["Screen"]
+  </pre>
+  <figcaption>Stock ticker with server-side coalescing</figcaption>
+</figure>
+<p>
+  Coalescing protects both the network and the main thread. On reconnect, a snapshot is correct and cheap, because old prices are worthless.
+</p>
+
+<h3>Notification bell</h3>
+<p>
+  <strong>Recommended: SSE</strong> (fallback: long polling or polling every 30 to 60 seconds). Notifications are rare, text-only and server-to-client, which is what SSE is for. Fetch the unread count over REST on load, then let SSE push increments. For notifications when the tab is closed, use the Push API with a service worker, which is a different mechanism (<a class="figref" href="#fig-notify"></a>).
+</p>
+<figure class="diagram" id="fig-notify">
+  <pre class="mermaid">
+sequenceDiagram
+  participant B as Browser
+  participant S as Server
+  B->>S: GET /notifications/unread-count
+  S-->>B: 200 with count 3
+  B->>S: GET /events (SSE stays open)
+  S-->>B: event notification with new count 4
+  B->>S: POST /notifications/read when the bell is opened
+  </pre>
+  <figcaption>Notification bell: initial count over REST, updates over SSE</figcaption>
+</figure>
+<p>
+  Starting from a REST snapshot means a dropped SSE stream never leaves the count wrong for long: reconnect and refetch.
+</p>
+
+<h3>News feed</h3>
+<p>
+  <strong>Recommended: REST or GraphQL with cursor pagination, plus a light "new posts" check.</strong> A feed is read-heavy and cacheable. Load pages by cursor for infinite scroll, cache the first page at the CDN or client, and poll cheaply (or use SSE) for a "new posts available" signal instead of inserting items under the user's eyes. Prefetch the next page when the user nears the end (<a class="figref" href="#fig-feed"></a>).
+</p>
+<figure class="diagram" id="fig-feed">
+  <pre class="mermaid">
+flowchart TD
+  L["Open feed"] -->|"GET page 1"| P1["Render first page"]
+  P1 -->|"user nears the end"| P2["Prefetch next page with the cursor"]
+  P1 -->|"poll every 30 s: anything newer?"| N["Show a New posts button"]
+  N -->|"user taps"| T["Insert the new posts at the top"]
+  </pre>
+  <figcaption>News feed: cursor pagination, prefetch and a new-posts banner</figcaption>
+</figure>
+<p>
+  Real-time insertion is avoided on purpose: content that jumps while someone reads is a worse experience than a one-tap refresh.
+</p>
+
+<h3>File upload</h3>
+<p>
+  <strong>Recommended: direct upload to object storage with a pre-signed URL, in resumable chunks for large files.</strong> Sending big files through your application server wastes its bandwidth and memory. The client asks your API for a signed URL, then uploads straight to storage. For files above a few megabytes, split into chunks so a dropped connection resumes instead of restarting. For progress bars, <code>XMLHttpRequest</code> exposes upload progress events; <code>fetch</code> does not (streaming uploads with <code>fetch</code> are only partly supported, VERIFY) (<a class="figref" href="#fig-upload"></a>).
+</p>
+<figure class="diagram" id="fig-upload">
+  <pre class="mermaid">
+sequenceDiagram
+  participant C as Browser
+  participant A as API server
+  participant O as Object storage
+  C->>A: POST /uploads with file name and size
+  A-->>C: Pre-signed URL and upload id
+  C->>O: PUT chunk 1, then chunk 2 and so on
+  O-->>C: 200 for each chunk, so a retry resends only the failed chunk
+  C->>A: POST /uploads/complete
+  </pre>
+  <figcaption>Direct, chunked upload with a pre-signed URL</figcaption>
+</figure>
+<p>
+  The API server only handles small metadata calls, and each chunk is idempotent, so retrying a failed chunk is safe.
+</p>
+
+<h3>Collaborative editor</h3>
+<p>
+  <strong>Recommended: WebSocket carrying operations, with a conflict-resolution algorithm (OT or CRDT).</strong> Many users edit the same document, so changes must flow quickly in both directions, and concurrent edits must merge without losing anyone's work. Send small operations, not whole documents, apply local edits immediately (optimistic updates) and reconcile with the server's order. Show presence (cursors) over the same channel and keep an offline queue (<a class="figref" href="#fig-collab"></a>). The algorithms themselves are beyond this chapter.
+</p>
+<figure class="diagram" id="fig-collab">
+  <pre class="mermaid">
+sequenceDiagram
+  participant A as Editor A
+  participant S as Sync server
+  participant B as Editor B
+  A->>A: Apply the edit locally at once
+  A->>S: Send operation over WebSocket
+  S->>S: Order and merge with concurrent operations
+  S-->>B: Broadcast the merged operation
+  S-->>A: Ack so A can confirm its edit
+  </pre>
+  <figcaption>Collaborative editing: local-first edits merged by the server</figcaption>
+</figure>
+<p>
+  Local application keeps typing instant; the server's merge keeps every copy convergent. This is the Pub/Sub pattern with an ordering step in the middle.
+</p>
+
+<!-- ======================================================================= PARTS -->
+<h2 class="part newpage">Trade-offs</h2>
+<p>Each row reads as a rule: use the option when the left condition holds, avoid it when the right one does.</p>
+
+<table>
+  <caption>TCP vs UDP (and QUIC)</caption>
+  <thead><tr><th>Option</th><th>Use when</th><th>Avoid when</th></tr></thead>
+  <tbody>
+    <tr><td>TCP</td><td>Every byte must arrive in order: web pages, APIs, file transfer, email.</td><td>A late packet is worse than a lost one (live audio, games), or connection setup cost hurts.</td></tr>
+    <tr><td>UDP</td><td>Low delay beats completeness, or you build your own reliability: DNS queries, live video, games.</td><td>You need guaranteed, ordered delivery and do not want to implement it.</td></tr>
+    <tr><td>QUIC (over UDP)</td><td>You want faster connection setup and no cross-stream blocking: HTTP/3, mobile networks that switch paths.</td><td>Networks that block or throttle UDP; always keep a TCP fallback.</td></tr>
+  </tbody>
+</table>
+
+<table>
+  <caption>Polling vs long polling vs SSE vs WebSocket</caption>
+  <thead><tr><th>Option</th><th>Use when</th><th>Avoid when</th></tr></thead>
+  <tbody>
+    <tr><td>Short polling</td><td>Updates are rare, a delay is fine, you want the simplest and most cacheable option.</td><td>You need updates within a second, or have many idle clients (wasted requests).</td></tr>
+    <tr><td>Long polling</td><td>You need near-instant updates but only plain HTTP is possible (old proxies, fallbacks).</td><td>Message rate is high: every message costs a new request.</td></tr>
+    <tr><td>SSE</td><td>Server-to-client text updates: notifications, tickers, progress. Auto-reconnect is wanted.</td><td>The client sends frequent messages, you need binary data, or you need many streams on HTTP/1.1.</td></tr>
+    <tr><td>WebSocket</td><td>Frequent two-way messages with low delay: chat, collaboration, games.</td><td>Updates are rare or one-way; you cannot afford stateful servers and custom reconnect logic.</td></tr>
+  </tbody>
+</table>
+
+<table>
+  <caption>REST vs GraphQL vs gRPC</caption>
+  <thead><tr><th>Option</th><th>Use when</th><th>Avoid when</th></tr></thead>
+  <tbody>
+    <tr><td>REST</td><td>Public or simple CRUD APIs, HTTP caching and CDN matter, broad tooling is needed.</td><td>Screens need many related resources (chatty calls) or very different field sets.</td></tr>
+    <tr><td>GraphQL</td><td>Many clients with different data needs, deep relationships, fast-changing UIs.</td><td>Simple APIs, heavy reliance on HTTP caching, or a team that cannot run query cost limits and batching.</td></tr>
+    <tr><td>gRPC</td><td>Service-to-service calls: strict contracts, small payloads, streaming, many languages.</td><td>Direct browser calls (needs gRPC-Web and a proxy) or public APIs for third parties.</td></tr>
+  </tbody>
+</table>
+
+<table>
+  <caption>HTTP/1.1 vs HTTP/2 vs HTTP/3</caption>
+  <thead><tr><th>Option</th><th>Use when</th><th>Avoid when</th></tr></thead>
+  <tbody>
+    <tr><td>HTTP/1.1</td><td>Simple servers, tooling, or a fallback for old clients.</td><td>Pages with many small resources: a few connections and head-of-line blocking slow them.</td></tr>
+    <tr><td>HTTP/2</td><td>Many parallel requests over one connection; header compression helps. The default on most hosts.</td><td>Very lossy networks: one lost TCP segment stalls all streams.</td></tr>
+    <tr><td>HTTP/3</td><td>Mobile and lossy networks, faster connection setup, connection migration.</td><td>Environments that block UDP (keep HTTP/2 fallback); servers or CDNs without support.</td></tr>
+  </tbody>
+</table>
+
+<table>
+  <caption>OSI vs TCP/IP model</caption>
+  <thead><tr><th>Option</th><th>Use when</th><th>Avoid when</th></tr></thead>
+  <tbody>
+    <tr><td>OSI (7 layers)</td><td>Talking precisely about where a device or protocol sits ("layer 4 load balancer"), teaching, troubleshooting.</td><td>Describing what the internet literally implements; layers 5 and 6 rarely exist as separate parts.</td></tr>
+    <tr><td>TCP/IP (4 layers)</td><td>Describing real protocol stacks and how data flows in practice.</td><td>You need a fine-grained name for a function such as session handling or encryption.</td></tr>
+  </tbody>
+</table>
+
+<h2 class="part newpage">Common mistakes</h2>
+<ul>
+  <li><strong>Treating bandwidth as the cure for slowness.</strong> Most API calls are small. Count round trips and cut them first.</li>
+  <li><strong>Assuming <code>fetch</code> rejects on 404 or 500.</strong> It only rejects on network failure. Check <code>res.ok</code>.</li>
+  <li><strong>No timeout and no cancellation.</strong> A stalled request hangs the UI, and stale responses overwrite fresh ones.</li>
+  <li><strong>Retrying everything immediately.</strong> Retry only transient errors, only safe requests, with backoff and jitter.</li>
+  <li><strong>Confusing <code>no-cache</code> with <code>no-store</code>.</strong> <code>no-cache</code> still stores and revalidates.</li>
+  <li><strong>Treating CORS as security for your API.</strong> The browser enforces it; other clients ignore it. Authenticate on the server.</li>
+  <li><strong>Reflecting any <code>Origin</code> with credentials allowed.</strong> Use an explicit allow-list.</li>
+  <li><strong>Polling when SSE would do, or WebSocket when SSE would do.</strong> Pick the lightest tool that meets the direction and rate.</li>
+  <li><strong>One socket per component.</strong> Share one connection and fan out events in the app.</li>
+  <li><strong>Reconnecting without jitter or resume.</strong> You get thundering herds and lost or duplicated messages.</li>
+  <li><strong>Offset pagination on a live feed.</strong> Items repeat or vanish as data changes. Use cursors.</li>
+  <li><strong>Using the HTTP/1.1 playbook everywhere.</strong> Domain sharding and mega-bundles can hurt on HTTP/2 and HTTP/3.</li>
+  <li><strong>Ignoring GraphQL's error shape.</strong> A 200 response can carry errors; monitor the body.</li>
+</ul>
+
+<h2 class="part newpage">Most-asked interview questions</h2>
+<p>Ordered from basic to advanced. Each answer is built to be spoken in about two minutes: lead with the short answer, then give structure.</p>
+
+<div class="qa">
+<h3 class="q">Q1. What is the difference between the OSI model and the TCP/IP model?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> Both describe how network communication is layered. OSI has seven layers and is a reference vocabulary. TCP/IP has four layers and describes what the internet actually runs.</p>
+<ul>
+  <li><strong>OSI:</strong> Application, Presentation, Session, Transport, Network, Data link, Physical.</li>
+  <li><strong>TCP/IP:</strong> Application, Transport, Internet, Link.</li>
+  <li><strong>Mapping:</strong> TCP/IP Application covers OSI 5 to 7. Transport matches Transport. Internet matches Network. Link covers OSI 1 and 2.</li>
+</ul>
+<p><strong>Why it matters.</strong> Engineers use OSI numbers as shorthand ("a layer 7 load balancer"), while real protocols such as HTTP, TLS and QUIC do not fit the OSI boxes cleanly. TLS is a good example: OSI places it near the presentation layer, TCP/IP treats it as part of the application layer on top of TCP.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q2. Which layer do HTTP, TCP, IP and DNS belong to?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> HTTP and DNS are application layer (layer 7). TCP is transport (layer 4). IP is network (layer 3).</p>
+<ul>
+  <li><strong>HTTP</strong> defines requests and responses between a browser and a server.</li>
+  <li><strong>DNS</strong> is an application protocol that translates names to IP addresses. It usually runs over UDP port 53, and uses TCP for large answers.</li>
+  <li><strong>TCP</strong> delivers a reliable, ordered stream between two programs, identified by ports.</li>
+  <li><strong>IP</strong> routes packets between machines, identified by IP addresses.</li>
+</ul>
+<p><strong>Follow-up to expect.</strong> "Where does HTTPS fit?" HTTPS is HTTP inside TLS, which sits between the application and the transport. "Where does HTTP/3 fit?" It runs over QUIC, which runs over UDP.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q3. What is encapsulation?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> Each layer wraps the data from the layer above in its own header (and sometimes a trailer) before passing it down. The receiver removes the wrappers in reverse order, which is decapsulation.</p>
+<ul>
+  <li>Application data (the HTTP request) becomes a TCP <strong>segment</strong> by adding ports and sequence numbers.</li>
+  <li>The segment becomes an IP <strong>packet</strong> by adding source and destination IP addresses.</li>
+  <li>The packet becomes an Ethernet or Wi-Fi <strong>frame</strong> by adding MAC addresses, then goes out as bits.</li>
+</ul>
+<p><strong>Why it matters.</strong> It explains how a router can forward a packet without understanding HTTP, and why each layer can change independently. Routers rewrite the frame at every hop but keep the IP packet inside.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q4. TCP vs UDP: when would you use each?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> TCP is reliable and ordered but pays setup cost and can stall on loss. UDP is connectionless and fast, but the application must handle loss.</p>
+<ul>
+  <li><strong>TCP:</strong> handshake, acknowledgements, retransmission, ordering, flow control (do not overwhelm the receiver) and congestion control (do not overwhelm the network). Use for web pages, APIs, email, file transfer.</li>
+  <li><strong>UDP:</strong> no handshake, no guarantees. Use for DNS queries, live video and voice, games, where a late packet is useless.</li>
+  <li><strong>QUIC:</strong> built on UDP, adds reliable streams and TLS 1.3, and powers HTTP/3. It avoids TCP's head-of-line blocking across streams.</li>
+</ul>
+<p><strong>Close with a rule.</strong> If correctness matters more than a few milliseconds, choose TCP. If freshness matters more than completeness, consider UDP.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q5. What is the difference between HTTP and HTTPS?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> HTTPS is HTTP carried over TLS. The messages are the same, but they are encrypted, tamper-evident and sent to a server whose identity was verified.</p>
+<ul>
+  <li><strong>Privacy:</strong> nobody on the path can read the traffic.</li>
+  <li><strong>Integrity:</strong> modifications are detected.</li>
+  <li><strong>Authentication:</strong> the server proves its identity with a certificate signed by a trusted authority; the browser checks the chain, hostname and expiry.</li>
+</ul>
+<p><strong>Cost and how to reduce it.</strong> TLS adds a handshake: one extra round trip in TLS 1.3, two in TLS 1.2. Keep-alive, session resumption and HTTP/3 reduce it. Many browser features (service workers, geolocation, secure cookies) require HTTPS, and HTTP pages are marked "not secure".</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q6. What happens when you type a URL into the browser and press Enter?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> The browser resolves the name, opens a connection, secures it, sends a request, receives a response and renders it. I will cover the network part.</p>
+<ol>
+  <li><strong>Parse the URL</strong> and check the browser cache and service worker. A fresh cached copy ends the journey here.</li>
+  <li><strong>DNS:</strong> look up the IP address, using browser, OS and resolver caches, and the DNS hierarchy on a miss.</li>
+  <li><strong>TCP handshake</strong> (one round trip), or QUIC for HTTP/3.</li>
+  <li><strong>TLS handshake</strong> for HTTPS (one round trip in TLS 1.3).</li>
+  <li><strong>Send the HTTP request</strong>. It may be answered by a CDN edge, otherwise by a load balancer and then the origin server.</li>
+  <li><strong>Response:</strong> the browser starts parsing HTML as bytes arrive and fetches sub-resources, reusing the open connection.</li>
+</ol>
+<p><strong>Show depth.</strong> Name the layer of each step and the shortcuts: cached DNS, keep-alive, TLS resumption, CDN. Rendering (parse, layout, paint) is a separate topic that I can continue into.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q7. What is the difference between an L4 and an L7 load balancer?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> An L4 load balancer routes by IP address and port without reading the content. An L7 load balancer reads the HTTP request and can route by URL, header or cookie.</p>
+<ul>
+  <li><strong>L4:</strong> very fast and simple, protocol-agnostic (works for any TCP or UDP service), but it cannot make content-based decisions.</li>
+  <li><strong>L7:</strong> can send <code>/api</code> to one pool and <code>/static</code> to another, terminate TLS, add headers, cache, rate-limit and do canary releases. It uses more CPU and must understand the protocol.</li>
+</ul>
+<p><strong>Frontend relevance.</strong> Long-lived connections such as WebSockets need the balancer to support them and to avoid idle timeouts. Many systems use both: L4 at the outermost edge, L7 behind it.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q8. How does HTTP caching work?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> The server labels responses with caching rules. The browser reuses a stored copy while it is fresh, and revalidates it when it is stale.</p>
+<ul>
+  <li><strong>Freshness:</strong> <code>Cache-Control: max-age=N</code> says the copy is good for N seconds with no request at all.</li>
+  <li><strong>Validation:</strong> once stale, the browser sends <code>If-None-Match</code> with the stored <code>ETag</code> (or <code>If-Modified-Since</code>). If unchanged, the server returns <code>304</code> with no body.</li>
+  <li><strong>Who may cache:</strong> <code>private</code> (browser only) or <code>public</code> (CDN too). <code>no-store</code> prevents storing.</li>
+  <li><strong>Background refresh:</strong> <code>stale-while-revalidate</code> shows the old copy instantly and updates it behind the scenes.</li>
+</ul>
+<p><strong>Strategy.</strong> Fingerprint static files (<code>app.3f9a1c.js</code>) and cache them for a year with <code>immutable</code>. Serve HTML with short or no freshness and validation, so users pick up new deploys.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q9. What is CORS, and why does the preflight request exist?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> Browsers block pages from reading responses from other origins by default (same-origin policy). CORS is the set of headers a server uses to opt in to being read by specific origins.</p>
+<ul>
+  <li><strong>Simple requests</strong> (for example <code>GET</code> with safe headers) are sent directly; the browser checks <code>Access-Control-Allow-Origin</code> on the response.</li>
+  <li><strong>Preflighted requests</strong> (methods like <code>PUT</code>, JSON content type, custom headers such as <code>Authorization</code>) first send an <code>OPTIONS</code> request with <code>Access-Control-Request-Method</code> and <code>-Headers</code>. The server answers with what is allowed.</li>
+  <li><strong>Why preflight:</strong> older servers were built assuming a web page could never send such requests cross-origin. The preflight asks permission before sending anything that could change state.</li>
+  <li><strong>Cost:</strong> an extra round trip, reduced by <code>Access-Control-Max-Age</code> (browsers cap it).</li>
+</ul>
+<p><strong>Common trap.</strong> CORS is not server security: it only controls what a browser lets scripts read. Use credentials with an explicit origin, never <code>*</code>.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q10. What is idempotency, and why does it matter for retries?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> An operation is idempotent if doing it several times has the same effect on the server as doing it once.</p>
+<ul>
+  <li><code>GET</code>, <code>PUT</code> and <code>DELETE</code> are idempotent by definition. <code>POST</code> is not.</li>
+  <li><strong>Why it matters:</strong> when a response is lost, the client cannot tell whether the server did the work. A retry of a non-idempotent call can charge twice or create duplicates.</li>
+  <li><strong>The fix for POST:</strong> send an <code>Idempotency-Key</code> generated per user action. The server stores the first result under that key and returns it for repeats.</li>
+</ul>
+<p><strong>Rule I would state.</strong> Automatic retries are safe for idempotent requests, and for others only with an idempotency key. Generate the key when the user clicks, so every retry reuses it.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q11. HTTP/2 vs HTTP/3: what problem does each solve?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> HTTP/2 fixes request-level blocking in HTTP/1.1 by multiplexing many streams on one TCP connection. HTTP/3 fixes TCP-level blocking by running over QUIC.</p>
+<ul>
+  <li><strong>HTTP/1.1:</strong> one request per connection at a time. Browsers open about six connections per host as a workaround.</li>
+  <li><strong>HTTP/2:</strong> multiplexed streams, header compression, one connection. But all streams share one TCP byte stream, so one lost packet stalls them all (TCP head-of-line blocking).</li>
+  <li><strong>HTTP/3:</strong> uses QUIC over UDP. Streams are independent, so loss on one does not block the others. It also merges transport and TLS handshakes, so setup is faster, and a connection can survive a network change such as Wi-Fi to mobile.</li>
+</ul>
+<p><strong>Practical advice.</strong> Enable HTTP/2 and HTTP/3 at your CDN, keep fallbacks, and stop using HTTP/1.1 workarounds such as domain sharding.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q12. WebSocket vs SSE vs long polling: how do you choose?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> Choose by direction and frequency of messages, then by infrastructure cost.</p>
+<ul>
+  <li><strong>Long polling:</strong> the client asks and the server holds the request until it has data. Works everywhere over plain HTTP, but each message costs a new request. Use as a fallback.</li>
+  <li><strong>SSE:</strong> one long-lived HTTP response, server to client, text only. Built-in reconnect and <code>Last-Event-ID</code>. Best for notifications, tickers and progress. Mind the six-connection limit on HTTP/1.1.</li>
+  <li><strong>WebSocket:</strong> full-duplex, low overhead, text or binary. Best for chat, collaboration and games. You write reconnect, heartbeat and ordering logic, and servers keep state per connection.</li>
+</ul>
+<p><strong>My default.</strong> If data flows only from server to client, I start with SSE. I move to WebSocket when the client also sends frequent messages. I use polling only when updates are rare.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q13. REST vs GraphQL vs gRPC: how do you decide?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> Pick by the caller and the pain: REST for simple and cacheable public APIs, GraphQL for flexible client-driven data, gRPC for fast service-to-service calls.</p>
+<ul>
+  <li><strong>REST:</strong> resources and HTTP methods. Excellent HTTP caching and tooling. Weakness: over-fetching and chains of calls for complex screens.</li>
+  <li><strong>GraphQL:</strong> the client specifies fields in one request to one endpoint. It removes over- and under-fetching. Costs: harder HTTP caching, query cost control, the N+1 problem on the server.</li>
+  <li><strong>gRPC:</strong> binary Protocol Buffers over HTTP/2, strict contracts, streaming. Not callable from browsers without gRPC-Web and a proxy.</li>
+</ul>
+<p><strong>Typical architecture.</strong> gRPC between services, a BFF or gateway in front, and REST or GraphQL to the browser. The choices combine.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q14. Why can't browsers call gRPC directly?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> gRPC needs control over HTTP/2 that browser APIs do not give. <code>fetch</code> and XHR hide frames, and gRPC sends its final status in HTTP/2 trailers.</p>
+<ul>
+  <li><strong>Trailers and framing:</strong> gRPC messages and statuses rely on low-level HTTP/2 behaviour that scripts cannot access.</li>
+  <li><strong>gRPC-Web:</strong> a browser-friendly variant that puts the status in the body. A proxy (commonly Envoy) translates gRPC-Web to native gRPC.</li>
+  <li><strong>Limits:</strong> unary and server-streaming calls work; client streaming and bidirectional streaming are not available from the browser.</li>
+</ul>
+<p><strong>Consequence.</strong> Teams often keep gRPC inside the backend and expose REST or GraphQL to the browser through a gateway or BFF, or accept the proxy and the streaming limits. Newer protocols that work in browsers exist; check current support (VERIFY).</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q15. How do you handle failed requests and rate limits on the client?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> Classify the failure, then react: retry what is transient and safe, stop on what is not, and always keep the user informed.</p>
+<ul>
+  <li><strong>Always:</strong> set a timeout, support cancellation, and check <code>res.ok</code>.</li>
+  <li><strong>Network error or 5xx:</strong> retry idempotent requests with exponential backoff and jitter, a small attempt cap, and a visible error at the end. Non-idempotent requests need an idempotency key.</li>
+  <li><strong>429:</strong> wait for <code>Retry-After</code>, then retry. Reduce your own call rate: batch, debounce, deduplicate.</li>
+  <li><strong>4xx (not 429):</strong> do not retry. Show validation errors, or refresh credentials once on 401.</li>
+  <li><strong>Offline:</strong> show cached data, queue user actions and replay them in order on reconnect.</li>
+</ul>
+<p><strong>Put it in one place.</strong> An API client layer applies these rules for every call, so components stay simple.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q16. What is a Backend-for-Frontend (BFF), and why use one?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> A BFF is a small backend dedicated to one frontend (web, iOS, Android). It aggregates internal services and returns exactly what that client's screens need.</p>
+<ul>
+  <li><strong>Problem it solves:</strong> internal APIs are general-purpose. A screen may need five calls and ten times more data than it shows, which hurts on mobile networks.</li>
+  <li><strong>What it does:</strong> calls services in parallel, merges and trims the data, hides internal protocols (for example gRPC), and can hold session or token handling.</li>
+  <li><strong>Patterns:</strong> it acts as a Facade (one simple interface) and an Adapter (internal shape to UI shape).</li>
+  <li><strong>Ownership benefit:</strong> the frontend team owns it and can change responses without waiting on several backend teams.</li>
+</ul>
+<p><strong>Trade-offs.</strong> One more service to run, and risk of duplicated logic between BFFs. An API gateway complements it by handling cross-cutting concerns such as auth and rate limits at the edge.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q17. How would you design reconnection logic for a chat application?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> Detect failure quickly, reconnect with jittered exponential backoff, resume from the last message seen, and make message handling idempotent.</p>
+<ol>
+  <li><strong>Detect:</strong> listen for <code>close</code>, and run an application heartbeat (ping and pong). If no pong arrives in a few seconds, close the socket and treat it as down.</li>
+  <li><strong>Reconnect:</strong> wait a random time up to <code>min(cap, base x 2^attempt)</code>. Reset the attempt count after a successful connection. Pause while the browser is offline and retry when the <code>online</code> event fires.</li>
+  <li><strong>Resume:</strong> every server message has an increasing sequence number. On connect, the client sends the last one it processed, and the server replays what was missed. If the gap is too large, refetch history over REST.</li>
+  <li><strong>Deduplicate:</strong> ignore any message with a sequence number already seen. Give each outgoing message a client id, keep it pending until acknowledged, and resend with the same id.</li>
+  <li><strong>UI:</strong> show "reconnecting", keep unsent messages visible, and share a single socket across the app.</li>
+</ol>
+<p><strong>Server side.</strong> Spread reconnects with jitter to avoid a thundering herd, and use a Pub/Sub broker so any server can deliver to any user.</p>
+</div>
+</div>
+
+<div class="qa">
+<h3 class="q">Q18. Which protocol would you choose for a live stock ticker, and how would you build it?</h3>
+<div class="answer">
+<p><strong>Short answer.</strong> SSE or WebSocket, with the server coalescing updates. I would start with SSE because data flows one way, and move to WebSocket if the client needs to send frequent subscription changes.</p>
+<ul>
+  <li><strong>Transport:</strong> SSE gives automatic reconnect and plain HTTP. WebSocket suits two-way control messages or binary payloads. Over HTTP/1.1, watch the six-connection limit, so use one stream and multiplex symbols inside it.</li>
+  <li><strong>Rate control:</strong> price feeds are faster than the eye. The server keeps only the latest price per symbol and sends it every 100 to 250 ms. The client updates only changed rows.</li>
+  <li><strong>Reconnect:</strong> send a fresh snapshot, not missed ticks, because old prices have no value.</li>
+  <li><strong>Subscriptions:</strong> subscribe only to symbols on screen, and unsubscribe when they scroll away.</li>
+  <li><strong>Scale:</strong> many socket servers behind a load balancer, fed by a Pub/Sub broker. Fan-out is the cost, so consider sending deltas.</li>
+  <li><strong>Backup:</strong> a REST endpoint for the snapshot and a polling fallback when streaming is blocked.</li>
+</ul>
+</div>
+</div>
+
+<section class="cheatsheet">
+  <h2 class="part">One-page cheat sheet</h2>
+  <table>
+    <thead><tr><th>#</th><th>Layer</th><th>Unit</th><th>Address</th><th>Protocols</th><th>Devices</th></tr></thead>
+    <tbody>
+      <tr><td>7</td><td>Application</td><td>Data</td><td>URL, host</td><td>HTTP, HTTPS, DNS, WebSocket, SMTP, SSH</td><td>Proxy, L7 LB, CDN</td></tr>
+      <tr><td>6</td><td>Presentation</td><td>Data</td><td>none</td><td>TLS, UTF-8, gzip</td><td></td></tr>
+      <tr><td>5</td><td>Session</td><td>Data</td><td>none</td><td>Session handling</td><td></td></tr>
+      <tr><td>4</td><td>Transport</td><td>Segment</td><td>Port</td><td>TCP, UDP, QUIC</td><td>L4 LB, firewall</td></tr>
+      <tr><td>3</td><td>Network</td><td>Packet</td><td>IP</td><td>IP, ICMP</td><td>Router</td></tr>
+      <tr><td>2</td><td>Data link</td><td>Frame</td><td>MAC</td><td>Ethernet, Wi-Fi, ARP</td><td>Switch</td></tr>
+      <tr><td>1</td><td>Physical</td><td>Bits</td><td>none</td><td>Cable, fibre, radio</td><td></td></tr>
+    </tbody>
+  </table>
+  <div class="cols">
+    <h3>Speed rules</h3>
+    <ul>
+      <li>Small requests: cut round trips. Big responses: cut bytes.</li>
+      <li>Page load chain: DNS, TCP, TLS 1.3 (1 RTT), HTTP.</li>
+      <li>Reuse connections (keep-alive), use a CDN, enable HTTP/2 and HTTP/3.</li>
+    </ul>
+    <h3>HTTP</h3>
+    <ul>
+      <li>Safe: GET, HEAD, OPTIONS. Idempotent: GET, PUT, DELETE. POST is neither.</li>
+      <li>2xx ok, 3xx redirect, 4xx client, 5xx server. <code>fetch</code> does not reject on 4xx or 5xx.</li>
+      <li>Fresh: <code>max-age</code>. Stale: ETag, then 304. <code>no-store</code> means never store.</li>
+      <li>Non-simple cross-origin request: preflight (<code>OPTIONS</code>). CORS is browser-enforced.</li>
+    </ul>
+    <h3>Live updates</h3>
+    <ul>
+      <li>Rare updates: polling. Server to client: SSE. Two-way and frequent: WebSocket. Calls and P2P: WebRTC.</li>
+      <li>Reconnect: heartbeat, jittered backoff, resume by sequence, dedupe.</li>
+    </ul>
+    <h3>APIs</h3>
+    <ul>
+      <li>REST: cacheable and simple. GraphQL: flexible, watch N+1 and cost. gRPC: service to service, needs gRPC-Web in browsers.</li>
+      <li>Lists: cursor pagination. POST retries: Idempotency-Key.</li>
+      <li>BFF per client, gateway at the edge.</li>
+    </ul>
+    <h3>Resilience</h3>
+    <ul>
+      <li>Timeout and abort every request. Retry only transient and safe failures.</li>
+      <li>429: honour <code>Retry-After</code>. Dedupe, batch, debounce. Queue while offline.</li>
+    </ul>
+  </div>
+</section>
+
+<h2 class="part newpage">Further reading</h2>
+<p>Primary sources worth opening after this chapter. Titles describe what each covers; I did not copy their wording.</p>
+<ul>
+  <li><strong>MDN Web Docs, "HTTP"</strong> (developer.mozilla.org/en-US/docs/Web/HTTP): practical guides on caching, CORS, cookies, and headers.</li>
+  <li><strong>RFC 9110 (HTTP Semantics) and RFC 9111 (HTTP Caching)</strong> (rfc-editor.org): the authoritative definitions of methods, status codes and cache rules.</li>
+  <li><strong>RFC 9114 (HTTP/3) and RFC 9000 (QUIC)</strong> (rfc-editor.org): how HTTP/3 and its transport work.</li>
+  <li><strong>RFC 6455 (The WebSocket Protocol)</strong> (rfc-editor.org): the upgrade handshake, frames and closing.</li>
+  <li><strong>grpc.io documentation, including "gRPC-Web"</strong> (grpc.io/docs): call types, the .proto language, and the browser limits.</li>
+  <li><strong>graphql.org, "Learn"</strong> (graphql.org/learn): schemas, queries, and the execution model.</li>
+</ul>
+
+<h2 class="part">Editorial notes</h2>
+<div class="editorial">
+  <ul>
+    <li><strong>Structure:</strong> topics are numbered H2 (1.1 to 1.11) and subtopics numbered H3. Every subtopic has its own heading, explanation, and at least one figure, referenced in the text.</li>
+    <li><strong>Added:</strong> "1.10.6 An API client layer" (Facade and Adapter patterns, as requested in the patterns list), and a short "Trade-offs" part with the five required comparison tables.</li>
+    <li><strong>Split:</strong> "Important headers, content negotiation, compression" became two subtopics; "TCP handshake, TLS handshake, HTTPS" became two; "Request/response anatomy, methods, status codes" became three; "Timeouts, retries, dedupe, debounce" became three; "Idempotency, pagination, filtering, sorting, versioning" became three.</li>
+    <li><strong>Reordered:</strong> the "which transport protocol" flowchart sits inside the TCP vs UDP subtopic; the mnemonic closes the layers topic; comparison figures sit beside the subtopic they explain.</li>
+    <li><strong>Roadmap:</strong> Chapter 1 is Networking; the RADIO approach chapter is now Chapter 11 in <code>src/chapters.json</code>. The rest of that roadmap is a working assumption, because no earlier roadmap file existed.</li>
+    <li><strong>Pattern placement:</strong> Layered architecture (1.2.1), Client-server (1.3.1), Observer / Pub-Sub (1.5.3, 1.5.7, 1.11.6), Singleton (1.5.4), Retry with backoff (1.5.6, 1.10.2), Adapter and Facade (1.9.3, 1.10.6), Backend-for-Frontend (1.9.3).</li>
+    <li><strong>Not run in the author's sandbox:</strong> the Express and <code>ws</code> examples need <code>npm install</code>; they were syntax-checked only.</li>
+  </ul>
+</div>

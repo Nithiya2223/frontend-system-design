@@ -1,0 +1,17 @@
+{
+  "_note": "Planned chapter roadmap. Only chapters with a file in src/chapters/ are built. status: planned | done. Order after chapter 1 is a working assumption; edit freely.",
+  "chapters": [
+    { "number": 1, "title": "Networking", "slug": "networking", "status": "done" },
+    { "number": 2, "title": "Browser Rendering and Web Performance", "slug": "rendering-performance", "status": "planned" },
+    { "number": 3, "title": "Web Security", "slug": "web-security", "status": "planned" },
+    { "number": 4, "title": "Client-Side Storage and Caching", "slug": "client-storage-caching", "status": "planned" },
+    { "number": 5, "title": "State Management", "slug": "state-management", "status": "planned" },
+    { "number": 6, "title": "Rendering Patterns: CSR, SSR, SSG, ISR", "slug": "rendering-patterns", "status": "planned" },
+    { "number": 7, "title": "Component and Application Architecture", "slug": "app-architecture", "status": "planned" },
+    { "number": 8, "title": "Micro-Frontends and Monorepos", "slug": "micro-frontends", "status": "planned" },
+    { "number": 9, "title": "Accessibility and Internationalization", "slug": "a11y-i18n", "status": "planned" },
+    { "number": 10, "title": "Testing, Monitoring and Observability", "slug": "testing-observability", "status": "planned" },
+    { "number": 11, "title": "How to Approach a Frontend System Design Interview (RADIO)", "slug": "radio-approach", "status": "planned" },
+    { "number": 12, "title": "Case Studies", "slug": "case-studies", "status": "planned" }
+  ]
+}
